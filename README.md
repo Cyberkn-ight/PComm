@@ -1,11 +1,11 @@
 # PComm (prototype)
 
-PComm is a **prototype** as of rn, an onion-relay messenger written in **pure C** with:
-- **SQLite** message storage (schema designed to extend to group chats later if I'm not too lazy)
-- A dogshit **embedded HTTP server** that serves a barebone **HTML/CSS/JS UI**
-- **User identifiers** derived from a Curve25519 (X25519) public key
-- **E2E encryption** using X25519 + HKDF-SHA256 + ChaCha20-Poly1305
-- **Onion-style forwarding type shit** through relay peers (3 max in this prototype for now)
+PComm is a **prototype** as of rn, an onion-relay messenger written in pure C (the graph lies shhhhhh) with:
+- SQLite message storage (schema designed to extend to group chats later if I'm not too lazy)
+- A dogshit embedded HTTP server that serves a barebone HTML/CSS/JS UI
+- User identifiers derived from a Curve25519 (X25519) public key
+- E2E encryption using X25519 + HKDF-SHA256 + ChaCha20-Poly1305
+- Onion-style forwarding type shit through relay peers (3 max in this prototype for now)
 It is inspired from my good friend [S3](https://github.com/S3NP41-v) [Pcomm project](https://github.com/S3NP41-v/PComm)
 
 >  This is not production-or-daily-use-ready software. It lacks many protections Tor uses (padding schedules, guard policy, congestion control, DoS hardening, directory/dht discovery, rendezvous/intro points, etc and even some more.). Use at your own risk for learning/testing only. It will change in the following weeks.
