@@ -8,7 +8,7 @@ PComm is a **prototype** as of rn, an onion-relay messenger written in **pure C*
 - **Onion-style forwarding type shit** through relay peers (3 max in this prototype for now)
 It is inspired from my good friend [S3](https://github.com/S3NP41-v) [Pcomm project](https://github.com/S3NP41-v/PComm)
 
->  This is not production-ready software. It lacks many protections Tor uses (padding schedules, guard policy, congestion control, DoS hardening, directory/dht discovery, rendezvous/intro points, etc.). Use at your own risk for learning/testing only.
+>  This is not production-or-daily-use-ready software. It lacks many protections Tor uses (padding schedules, guard policy, congestion control, DoS hardening, directory/dht discovery, rendezvous/intro points, etc and even some more.). Use at your own risk for learning/testing only. It will change in the following weeks.
 
 ## Build
 
