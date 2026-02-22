@@ -1,0 +1,13 @@
+{
+  "nav.contacts": "Contacts",
+  "nav.chats": "Discussions",
+  "contact.add": "Ajouter",
+  "contact.is_relay": "Relais",
+  "chat.title": "Discussion",
+  "chat.with": "Discussion avec",
+  "message.placeholder": "Écrivez un message…",
+  "message.send": "Envoyer",
+  "message.in": "entrant",
+  "message.out": "sortant",
+  "me.id": "Mon identifiant"
+}

@@ -1,0 +1,5 @@
+# Example relay peers file for PComm
+# One per line:
+# <user_id> <host> <port>
+
+# pcomm1_...  127.0.0.1  9002

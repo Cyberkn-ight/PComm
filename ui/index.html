@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>PComm</title>
+  <link rel="stylesheet" href="/app.css"/>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div>
+        <div class="brand">PComm</div>
+        <div class="sub" id="me"></div>
+      </div>
+      <div class="lang">
+        <select id="langSelect">
+          <option value="en">English</option>
+          <option value="fr">Français</option>
+        </select>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card">
+        <h2 data-i18n="nav.contacts">Contacts</h2>
+        <div class="row">
+          <input id="c_id" placeholder="pcomm1_..."/>
+          <input id="c_host" placeholder="host"/>
+          <input id="c_port" placeholder="9001"/>
+          <label class="chk"><input type="checkbox" id="c_relay"/> <span data-i18n="contact.is_relay">Relay</span></label>
+          <button id="btnAdd" data-i18n="contact.add">Add</button>
+        </div>
+        <div id="contacts" class="list"></div>
+      </section>
+
+      <section class="card">
+        <h2 data-i18n="nav.chats">Chats</h2>
+        <div id="conversations" class="list"></div>
+      </section>
+
+      <section class="card chat">
+        <h2 id="chatTitle" data-i18n="chat.title">Chat</h2>
+        <div id="messages" class="msgs"></div>
+        <div class="row">
+          <input id="to" placeholder="to (user id)"/>
+          <input id="text" placeholder="Type a message…"/>
+          <button id="btnSend" data-i18n="message.send">Send</button>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span class="muted">Prototype: do not use for real anonymity/safety.</span>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

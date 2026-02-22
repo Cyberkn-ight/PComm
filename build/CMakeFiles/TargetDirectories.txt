@@ -1,0 +1,3 @@
+/mnt/data/PComm/build/CMakeFiles/pcomm.dir
+/mnt/data/PComm/build/CMakeFiles/edit_cache.dir
+/mnt/data/PComm/build/CMakeFiles/rebuild_cache.dir

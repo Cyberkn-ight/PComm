@@ -1,0 +1,41 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/pcomm.dir/src/base32.c.o"
+  "CMakeFiles/pcomm.dir/src/base32.c.o.d"
+  "CMakeFiles/pcomm.dir/src/config.c.o"
+  "CMakeFiles/pcomm.dir/src/config.c.o.d"
+  "CMakeFiles/pcomm.dir/src/crypto.c.o"
+  "CMakeFiles/pcomm.dir/src/crypto.c.o.d"
+  "CMakeFiles/pcomm.dir/src/db.c.o"
+  "CMakeFiles/pcomm.dir/src/db.c.o.d"
+  "CMakeFiles/pcomm.dir/src/http.c.o"
+  "CMakeFiles/pcomm.dir/src/http.c.o.d"
+  "CMakeFiles/pcomm.dir/src/http_util.c.o"
+  "CMakeFiles/pcomm.dir/src/http_util.c.o.d"
+  "CMakeFiles/pcomm.dir/src/identity.c.o"
+  "CMakeFiles/pcomm.dir/src/identity.c.o.d"
+  "CMakeFiles/pcomm.dir/src/main.c.o"
+  "CMakeFiles/pcomm.dir/src/main.c.o.d"
+  "CMakeFiles/pcomm.dir/src/msg.c.o"
+  "CMakeFiles/pcomm.dir/src/msg.c.o.d"
+  "CMakeFiles/pcomm.dir/src/net.c.o"
+  "CMakeFiles/pcomm.dir/src/net.c.o.d"
+  "CMakeFiles/pcomm.dir/src/onion.c.o"
+  "CMakeFiles/pcomm.dir/src/onion.c.o.d"
+  "CMakeFiles/pcomm.dir/src/peers.c.o"
+  "CMakeFiles/pcomm.dir/src/peers.c.o.d"
+  "CMakeFiles/pcomm.dir/src/proto.c.o"
+  "CMakeFiles/pcomm.dir/src/proto.c.o.d"
+  "CMakeFiles/pcomm.dir/src/relay.c.o"
+  "CMakeFiles/pcomm.dir/src/relay.c.o.d"
+  "CMakeFiles/pcomm.dir/src/sb.c.o"
+  "CMakeFiles/pcomm.dir/src/sb.c.o.d"
+  "CMakeFiles/pcomm.dir/src/sendmsg.c.o"
+  "CMakeFiles/pcomm.dir/src/sendmsg.c.o.d"
+  "pcomm"
+  "pcomm.pdb"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang C)
+  include(CMakeFiles/pcomm.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

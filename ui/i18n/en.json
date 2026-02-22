@@ -1,0 +1,13 @@
+{
+  "nav.contacts": "Contacts",
+  "nav.chats": "Chats",
+  "contact.add": "Add",
+  "contact.is_relay": "Relay",
+  "chat.title": "Chat",
+  "chat.with": "Chat with",
+  "message.placeholder": "Type a message…",
+  "message.send": "Send",
+  "message.in": "in",
+  "message.out": "out",
+  "me.id": "My ID"
+}
