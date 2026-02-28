@@ -4,6 +4,8 @@
 #include "peers.h"
 #include "relay.h"
 #include "http.h"
+#include "mesh.h"
+#include "hidden.h"
 
 #include <stdio.h>
 #include <signal.h>
@@ -56,6 +58,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to start HTTP server\n");
         return 1;
     }
+
+    pcomm_mesh_start(&cfg, &me, &db);
+    pcomm_hidden_start(&cfg, &me, &db);
 
     while (g_running) {
         sleep(1);

@@ -17,6 +17,8 @@ add_executable(pcomm
     src/msg.c
     src/relay.c
     src/sendmsg.c
+    src/mesh.c
+    src/hidden.c
     src/sb.c
     src/http_util.c
     src/http.c

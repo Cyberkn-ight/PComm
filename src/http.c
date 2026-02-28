@@ -5,6 +5,9 @@
 #include "http_util.h"
 #include "sendmsg.h"
 #include "identity.h"
+#include "hidden.h"
+#include "db.h"
+#include "crypto.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -14,6 +17,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sqlite3.h>
 
 typedef struct {
@@ -74,7 +78,7 @@ static int read_file(const char *path, uint8_t **out, size_t *out_len) {
 static int serve_file(int fd, const char *ui_dir, const char *req_path) {
     char path[1024];
     if (strcmp(req_path, "/") == 0) req_path = "/index.html";
-//path condom lol
+
     if (strstr(req_path, "..")) return send_resp(fd, 400, "text/plain", "bad path", 8);
 
     snprintf(path, sizeof(path), "%s%s", ui_dir, req_path);
@@ -136,8 +140,8 @@ static int api_contacts(http_state_t *st, int fd) {
 
 static int api_conversations(http_state_t *st, int fd) {
     const char *sql =
-        "SELECT c.id, c.type, IFNULL(c.title,''), "
-        "IFNULL((SELECT user_id FROM participants p WHERE p.conversation_id=c.id LIMIT 1), '') AS peer, "
+        "SELECT c.id, IFNULL(c.uuid,''), c.type, IFNULL(c.title,''), "
+        "CASE WHEN c.type='direct' THEN IFNULL((SELECT user_id FROM participants p WHERE p.conversation_id=c.id LIMIT 1), '') ELSE '' END AS peer, "
         "IFNULL((SELECT body FROM messages m WHERE m.conversation_id=c.id ORDER BY ts_unix DESC, id DESC LIMIT 1), '') AS last_body, "
         "IFNULL((SELECT ts_unix FROM messages m WHERE m.conversation_id=c.id ORDER BY ts_unix DESC, id DESC LIMIT 1), 0) AS last_ts "
         "FROM conversations c "
@@ -153,12 +157,14 @@ static int api_conversations(http_state_t *st, int fd) {
     int first = 1;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         int64_t id = sqlite3_column_int64(stmt, 0);
-        const char *type = (const char*)sqlite3_column_text(stmt, 1);
-        const char *title = (const char*)sqlite3_column_text(stmt, 2);
-        const char *peer = (const char*)sqlite3_column_text(stmt, 3);
-        const char *last_body = (const char*)sqlite3_column_text(stmt, 4);
-        int64_t last_ts = sqlite3_column_int64(stmt, 5);
+        const char *uuid = (const char*)sqlite3_column_text(stmt, 1);
+        const char *type = (const char*)sqlite3_column_text(stmt, 2);
+        const char *title = (const char*)sqlite3_column_text(stmt, 3);
+        const char *peer = (const char*)sqlite3_column_text(stmt, 4);
+        const char *last_body = (const char*)sqlite3_column_text(stmt, 5);
+        int64_t last_ts = sqlite3_column_int64(stmt, 6);
         if (!type) type = "";
+        if (!uuid) uuid = "";
         if (!title) title = "";
         if (!peer) peer = "";
         if (!last_body) last_body = "";
@@ -168,6 +174,7 @@ static int api_conversations(http_state_t *st, int fd) {
 
         sb_append(&sb, "{");
         sb_appendf(&sb, "\"id\":%lld,", (long long)id);
+        sb_append(&sb, "\"uuid\":\""); sb_append_json_escaped(&sb, uuid); sb_append(&sb, "\",");
         sb_append(&sb, "\"type\":\""); sb_append_json_escaped(&sb, type); sb_append(&sb, "\",");
         sb_append(&sb, "\"title\":\""); sb_append_json_escaped(&sb, title); sb_append(&sb, "\",");
         sb_append(&sb, "\"peer\":\""); sb_append_json_escaped(&sb, peer); sb_append(&sb, "\",");
@@ -183,13 +190,11 @@ static int api_conversations(http_state_t *st, int fd) {
 }
 
 static int api_messages(http_state_t *st, int fd, const char *query) {
-    // expect conv=<id>
     char conv_id_str[64] = {0};
     if (query) {
         const char *p = strstr(query, "conv=");
         if (p) {
             snprintf(conv_id_str, sizeof(conv_id_str), "%s", p + 5);
-            // strip after & (im alone)
             char *amp = strchr(conv_id_str, '&');
             if (amp) *amp = '\0';
         }
@@ -243,6 +248,115 @@ static int api_send(http_state_t *st, int fd, const char *body) {
     return send_resp(fd, 500, "application/json; charset=utf-8", "{\"ok\":false}", 12);
 }
 
+static void trim(char *s) {
+    if (!s) return;
+    char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n-1])) { s[n-1] = '\0'; n--; }
+}
+
+static void hex16(uint8_t b[16], char out[33]) {
+    static const char *hex = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[i*2+0] = hex[(b[i] >> 4) & 0xF];
+        out[i*2+1] = hex[b[i] & 0xF];
+    }
+    out[32] = '\0';
+}
+
+static int api_create_group(http_state_t *st, int fd, const char *body) {
+    char title[256] = {0};
+    char members_raw[2048] = {0};
+    form_get_field(body, "title", title, sizeof(title));
+    if (form_get_field(body, "members", members_raw, sizeof(members_raw)) != 0) {
+        return send_resp(fd, 400, "text/plain", "missing members", 15);
+    }
+    trim(title);
+    trim(members_raw);
+
+    char *tmp = strdup(members_raw);
+    if (!tmp) return send_resp(fd, 500, "text/plain", "oom", 3);
+
+    char *members[65];
+    int mcount = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(tmp, ",", &save); tok && mcount < 64; tok = strtok_r(NULL, ",", &save)) {
+        trim(tok);
+        if (tok[0] == '\0') continue;
+        uint8_t pk[32];
+        if (pcomm_pubkey_from_user_id(tok, pk) != 0) continue;
+        members[mcount++] = strdup(tok);
+    }
+    free(tmp);
+    if (mcount == 0) return send_resp(fd, 400, "text/plain", "no valid members", 16);
+
+    if (mcount < 65) members[mcount++] = strdup(st->me.user_id);
+
+    uint8_t rnd[16];
+    pcomm_random(rnd, sizeof(rnd));
+    char uuid[33];
+    hex16(rnd, uuid);
+
+    int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, uuid, title[0] ? title : "");
+    if (conv_id < 0) {
+        for (int i = 0; i < mcount; i++) free(members[i]);
+        return send_resp(fd, 500, "text/plain", "db error", 8);
+    }
+    for (int i = 0; i < mcount; i++) {
+        pcomm_db_add_participant(st->db, conv_id, members[i]);
+    }
+
+    for (int i = 0; i < mcount; i++) {
+        if (strcmp(members[i], st->me.user_id) == 0) continue;
+        pcomm_hidden_send_group_invite(st->db, &st->cfg, &st->me, members[i], uuid, title, members, mcount);
+    }
+
+    for (int i = 0; i < mcount; i++) free(members[i]);
+
+    sb_t sb; sb_init(&sb);
+    sb_appendf(&sb, "{\"ok\":true,\"id\":%lld,\"uuid\":\"%s\"}", (long long)conv_id, uuid);
+    int rc = send_resp(fd, 200, "application/json; charset=utf-8", sb.buf, sb.len);
+    sb_free(&sb);
+    return rc;
+}
+
+static int api_send_group(http_state_t *st, int fd, const char *body) {
+    char conv_str[64] = {0};
+    char text[2048] = {0};
+    if (form_get_field(body, "conv", conv_str, sizeof(conv_str)) != 0) return send_resp(fd, 400, "text/plain", "missing conv", 12);
+    if (form_get_field(body, "text", text, sizeof(text)) != 0) return send_resp(fd, 400, "text/plain", "missing text", 12);
+    int64_t conv_id = atoll(conv_str);
+
+    char uuid[256] = {0};
+    char type[32] = {0};
+    if (pcomm_db_get_conversation_uuid(st->db, conv_id, uuid, sizeof(uuid), type, sizeof(type)) != 0) {
+        return send_resp(fd, 400, "text/plain", "bad conv", 8);
+    }
+    if (strcmp(type, "group") != 0 || uuid[0] == '\0') {
+        return send_resp(fd, 400, "text/plain", "not group", 9);
+    }
+
+    char **members = NULL; int mcount = 0;
+    if (pcomm_db_list_group_participants(st->db, conv_id, &members, &mcount) != 0 || mcount == 0) {
+        return send_resp(fd, 500, "text/plain", "db error", 8);
+    }
+
+    for (int i = 0; i < mcount; i++) {
+        if (!members[i]) continue;
+        if (strcmp(members[i], st->me.user_id) == 0) continue;
+        pcomm_hidden_send_group_text(st->db, &st->cfg, &st->me, members[i], uuid, text);
+    }
+
+    pcomm_db_insert_message(st->db, conv_id, 1, uuid, st->me.user_id, text, (const uint8_t*)"", 0, (int64_t)time(NULL));
+
+    for (int i = 0; i < mcount; i++) free(members[i]);
+    free(members);
+
+    return send_resp(fd, 200, "application/json; charset=utf-8", "{\"ok\":true}", 11);
+}
+
 static int api_add_contact(http_state_t *st, int fd, const char *body) {
     char id[128] = {0};
     char host[128] = {0};
@@ -250,8 +364,8 @@ static int api_add_contact(http_state_t *st, int fd, const char *body) {
     char relay_str[8] = {0};
 
     if (form_get_field(body, "id", id, sizeof(id)) != 0) return send_resp(fd, 400, "text/plain", "missing id", 10);
-    if (form_get_field(body, "host", host, sizeof(host)) != 0) return send_resp(fd, 400, "text/plain", "missing host", 12);
-    if (form_get_field(body, "port", port_str, sizeof(port_str)) != 0) return send_resp(fd, 400, "text/plain", "missing port", 12);
+    form_get_field(body, "host", host, sizeof(host));
+    form_get_field(body, "port", port_str, sizeof(port_str));
     form_get_field(body, "relay", relay_str, sizeof(relay_str));
 
     uint16_t port = (uint16_t)atoi(port_str);
@@ -262,7 +376,7 @@ static int api_add_contact(http_state_t *st, int fd, const char *body) {
         return send_resp(fd, 400, "text/plain", "bad id", 6);
     }
 
-    if (pcomm_db_upsert_contact(st->db, id, host, port, pubkey, is_relay) != 0) {
+    if (pcomm_db_upsert_contact(st->db, id, host[0] ? host : "", port, pubkey, is_relay) != 0) {
         return send_resp(fd, 500, "text/plain", "db error", 8);
     }
 
@@ -276,6 +390,8 @@ static int route_request(http_state_t *st, int fd, const char *method, const cha
         if (strcmp(path, "/api/conversations") == 0 && strcmp(method, "GET") == 0) return api_conversations(st, fd);
         if (strcmp(path, "/api/messages") == 0 && strcmp(method, "GET") == 0) return api_messages(st, fd, query);
         if (strcmp(path, "/api/send") == 0 && strcmp(method, "POST") == 0) return api_send(st, fd, body ? body : "");
+        if (strcmp(path, "/api/create_group") == 0 && strcmp(method, "POST") == 0) return api_create_group(st, fd, body ? body : "");
+        if (strcmp(path, "/api/send_group") == 0 && strcmp(method, "POST") == 0) return api_send_group(st, fd, body ? body : "");
         if (strcmp(path, "/api/add_contact") == 0 && strcmp(method, "POST") == 0) return api_add_contact(st, fd, body ? body : "");
         return send_resp(fd, 404, "text/plain", "not found", 9);
     }

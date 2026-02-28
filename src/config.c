@@ -22,6 +22,8 @@ void pcomm_config_defaults(pcomm_config_t *cfg) {
     snprintf(cfg->ui_dir, sizeof(cfg->ui_dir), "./ui");
     snprintf(cfg->relay_host, sizeof(cfg->relay_host), "0.0.0.0");
     cfg->relay_port = 9001;
+    cfg->advertise_host[0] = '\0';
+    cfg->advertise_port = 0;
     snprintf(cfg->http_host, sizeof(cfg->http_host), "127.0.0.1");
     cfg->http_port = 8080;
     snprintf(cfg->peers_path, sizeof(cfg->peers_path), "./peers.txt");
@@ -29,13 +31,14 @@ void pcomm_config_defaults(pcomm_config_t *cfg) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "PComm - minimal onion-relay messenger (prototype)\n\n"
+        "PComm - the other one (prototype)\n\n"
         "Usage: %s [options]\n\n"
         "Options:\n"
         "  --data-dir PATH     Data directory (default ./pcomm_data)\n"
         "  --ui-dir PATH       UI directory (default ./ui)\n"
         "  --relay HOST:PORT   Relay listen address (default 0.0.0.0:9001)\n"
         "  --http HOST:PORT    HTTP listen address (default 127.0.0.1:8080)\n"
+        "  --advertise HOST:PORT Public relay address advertised to the mesh (default: use --relay)\n"
         "  --peers PATH        Peers file (default ./peers.txt)\n"
         "\nPeers file format (one per line):\n"
         "  <user_id> <host> <port>\n"
@@ -71,6 +74,14 @@ int pcomm_config_from_argv(pcomm_config_t *cfg, int argc, char **argv) {
             }
             snprintf(cfg->http_host, sizeof(cfg->http_host), "%s", host);
             cfg->http_port = port;
+        } else if (strcmp(a, "--advertise") == 0 && i + 1 < argc) {
+            char host[64]; uint16_t port;
+            if (parse_hostport(argv[++i], host, sizeof(host), &port) != 0) {
+                fprintf(stderr, "Bad --advertise value\n");
+                return -1;
+            }
+            snprintf(cfg->advertise_host, sizeof(cfg->advertise_host), "%s", host);
+            cfg->advertise_port = port;
         } else if (strcmp(a, "--peers") == 0 && i + 1 < argc) {
             snprintf(cfg->peers_path, sizeof(cfg->peers_path), "%s", argv[++i]);
         } else {
