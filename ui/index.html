@@ -26,8 +26,8 @@
         <h2 data-i18n="nav.contacts">Contacts</h2>
         <div class="row">
           <input id="c_id" placeholder="pcomm1_..."/>
-          <input id="c_host" placeholder="host"/>
-          <input id="c_port" placeholder="9001"/>
+          <input id="c_host" placeholder="host (optional)"/>
+          <input id="c_port" placeholder="9001 (optional)"/>
           <label class="chk"><input type="checkbox" id="c_relay"/> <span data-i18n="contact.is_relay">Relay</span></label>
           <button id="btnAdd" data-i18n="contact.add">Add</button>
         </div>
@@ -36,6 +36,11 @@
 
       <section class="card">
         <h2 data-i18n="nav.chats">Chats</h2>
+        <div class="row">
+          <input id="g_title" placeholder="Group title"/>
+          <input id="g_members" placeholder="member ids (comma-separated)"/>
+          <button id="btnGroup" data-i18n="group.create">Create</button>
+        </div>
         <div id="conversations" class="list"></div>
       </section>
 

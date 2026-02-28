@@ -226,7 +226,7 @@ int pcomm_open_seal(const uint8_t recipient_priv[32],
     const uint8_t info[] = "pcomm-seal-v1";
     if (pcomm_hkdf_sha256(shared, sizeof(shared), NULL, 0, info, sizeof(info)-1, key, sizeof(key)) != 0) return -1;
 
-    uint8_t *pt = (uint8_t*)malloc(ct_len); // borne sup
+    uint8_t *pt = (uint8_t*)malloc(ct_len);
     if (!pt) return -1;
     size_t pt_len = ct_len;
 

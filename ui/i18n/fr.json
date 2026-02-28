@@ -4,10 +4,12 @@
   "contact.add": "Ajouter",
   "contact.is_relay": "Relais",
   "chat.title": "Discussion",
-  "chat.with": "Discussion avec",
+  "chat.with": "Discussion",
   "message.placeholder": "Écrivez un message…",
   "message.send": "Envoyer",
   "message.in": "entrant",
   "message.out": "sortant",
-  "me.id": "Mon identifiant"
+  "me.id": "Mon identifiant",
+  "group.create": "Créer",
+  "group.mode": "groupe"
 }

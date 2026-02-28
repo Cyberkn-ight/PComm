@@ -50,40 +50,39 @@ static int derive_hop_key(const uint8_t eph_priv[32], const uint8_t hop_pub[32],
     return 0;
 }
 
-int pcomm_onion_build(const pcomm_peer_t *path, size_t path_len,
-                      const char *dest_host, uint16_t dest_port,
-                      const char *recipient_id,
-                      const uint8_t *sealed, size_t sealed_len,
-                      uint8_t eph_pub_out[32],
-                      uint8_t **onion_payload_out, uint32_t *onion_payload_len_out) {
-    if (!path || path_len < 1 || !dest_host || !recipient_id || !sealed || !onion_payload_out || !onion_payload_len_out) return -1;
+int pcomm_onion_build_v1(const pcomm_peer_t *path, size_t path_len,
+                         const char *dest_host, uint16_t dest_port,
+                         pcomm_msg_type_t deliver_type,
+                         const uint8_t *deliver_payload, size_t deliver_len,
+                         int roundtrip,
+                         uint8_t eph_pub_out[32],
+                         uint8_t **onion_payload_out, uint32_t *onion_payload_len_out) {
+    if (!path || path_len < 1 || !dest_host || !deliver_payload || !onion_payload_out || !onion_payload_len_out) return -1;
 
     uint8_t eph_priv[32], eph_pub[32];
     if (x25519_keygen(eph_priv, eph_pub) != 0) return -1;
     memcpy(eph_pub_out, eph_pub, 32);
 
     size_t dest_host_len = strlen(dest_host);
-    size_t recip_len = strlen(recipient_id);
-    if (dest_host_len > 63 || recip_len > 90) return -1;
-
-    size_t pt0_len = 1 + 1 + dest_host_len + 2 + 2 + recip_len + 4 + sealed_len;
+    if (dest_host_len > 63) return -1;
+    uint8_t flags = (roundtrip != 0) ? 0x01 : 0x00;
+    size_t pt0_len = 1 + 1 + 1 + dest_host_len + 2 + 1 + 4 + deliver_len;
     uint8_t *pt0 = (uint8_t*)malloc(pt0_len);
     if (!pt0) return -1;
 
     size_t off = 0;
     pt0[off++] = (uint8_t)PCOMM_INST_DELIVER;
+    pt0[off++] = flags;
     pt0[off++] = (uint8_t)dest_host_len;
     memcpy(pt0 + off, dest_host, dest_host_len); off += dest_host_len;
     put_u16(pt0 + off, dest_port); off += 2;
-    put_u16(pt0 + off, (uint16_t)recip_len); off += 2;
-    memcpy(pt0 + off, recipient_id, recip_len); off += recip_len;
-    put_u32(pt0 + off, (uint32_t)sealed_len); off += 4;
-    memcpy(pt0 + off, sealed, sealed_len); off += sealed_len;
+    pt0[off++] = (uint8_t)deliver_type;
+    put_u32(pt0 + off, (uint32_t)deliver_len); off += 4;
+    memcpy(pt0 + off, deliver_payload, deliver_len); off += deliver_len;
     if (off != pt0_len) { free(pt0); return -1; }
 
     uint8_t *inner_blob = NULL;
     uint32_t inner_len = 0;
-
     {
         uint8_t key[32];
         if (derive_hop_key(eph_priv, path[path_len-1].pubkey, key) != 0) { free(pt0); return -1; }
@@ -104,7 +103,6 @@ int pcomm_onion_build(const pcomm_peer_t *path, size_t path_len,
         inner_blob = blob;
         inner_len = (uint32_t)(12 + ct_len);
     }
-
     free(pt0);
 
     for (ssize_t i = (ssize_t)path_len - 2; i >= 0; i--) {
@@ -112,13 +110,13 @@ int pcomm_onion_build(const pcomm_peer_t *path, size_t path_len,
         uint16_t next_port = path[i+1].port;
         size_t next_host_len = strlen(next_host);
         if (next_host_len > 63) { free(inner_blob); return -1; }
-
+        uint8_t inst = (roundtrip != 0) ? (uint8_t)PCOMM_INST_FORWARD_RR : (uint8_t)PCOMM_INST_FORWARD;
         size_t pt_len = 1 + 1 + next_host_len + 2 + 4 + inner_len;
         uint8_t *pt = (uint8_t*)malloc(pt_len);
         if (!pt) { free(inner_blob); return -1; }
 
         size_t off2 = 0;
-        pt[off2++] = (uint8_t)PCOMM_INST_FORWARD;
+        pt[off2++] = inst;
         pt[off2++] = (uint8_t)next_host_len;
         memcpy(pt + off2, next_host, next_host_len); off2 += next_host_len;
         put_u16(pt + off2, next_port); off2 += 2;
@@ -157,14 +155,15 @@ int pcomm_onion_build(const pcomm_peer_t *path, size_t path_len,
     return 0;
 }
 
-int pcomm_onion_unwrap(const uint8_t relay_priv[32], const uint8_t eph_pub[32],
-                       const uint8_t *payload, uint32_t payload_len,
-                       pcomm_inst_t *inst_out,
-                       char *next_host_out, size_t next_host_cap, uint16_t *next_port_out,
-                       uint8_t **next_payload_out, uint32_t *next_payload_len_out,
-                       char *recipient_id_out, size_t recipient_id_cap,
-                       uint8_t **sealed_out, uint32_t *sealed_len_out,
-                       char *dest_host_out, size_t dest_host_cap, uint16_t *dest_port_out) {
+int pcomm_onion_unwrap_v1(const uint8_t relay_priv[32], const uint8_t eph_pub[32],
+                          const uint8_t *payload, uint32_t payload_len,
+                          pcomm_inst_t *inst_out,
+                          char *next_host_out, size_t next_host_cap, uint16_t *next_port_out,
+                          uint8_t **next_payload_out, uint32_t *next_payload_len_out,
+                          char *dest_host_out, size_t dest_host_cap, uint16_t *dest_port_out,
+                          pcomm_msg_type_t *deliver_type_out,
+                          uint8_t *deliver_flags_out,
+                          uint8_t **deliver_payload_out, uint32_t *deliver_len_out) {
     if (!relay_priv || !eph_pub || !payload || payload_len < 12 + 16 || !inst_out) return -1;
 
     const uint8_t *nonce = payload;
@@ -185,13 +184,12 @@ int pcomm_onion_unwrap(const uint8_t relay_priv[32], const uint8_t eph_pub[32],
         return -1;
     }
 
-    if (pt_len < 2) { free(pt); return -1; }
-
+    if (pt_len < 1) { free(pt); return -1; }
     size_t off = 0;
     uint8_t inst = pt[off++];
     *inst_out = (pcomm_inst_t)inst;
 
-    if (inst == PCOMM_INST_FORWARD) {
+    if (inst == PCOMM_INST_FORWARD || inst == PCOMM_INST_FORWARD_RR) {
         if (pt_len < off + 1) { free(pt); return -1; }
         uint8_t hlen = pt[off++];
         if (pt_len < off + hlen + 2 + 4) { free(pt); return -1; }
@@ -214,31 +212,30 @@ int pcomm_onion_unwrap(const uint8_t relay_priv[32], const uint8_t eph_pub[32],
     }
 
     if (inst == PCOMM_INST_DELIVER) {
-        if (pt_len < off + 1) { free(pt); return -1; }
+        if (pt_len < off + 2) { free(pt); return -1; }
+        uint8_t flags = pt[off++];
+        if (deliver_flags_out) *deliver_flags_out = flags;
+
         uint8_t hlen = pt[off++];
-        if (pt_len < off + hlen + 2 + 2) { free(pt); return -1; }
+        if (pt_len < off + hlen + 2 + 1 + 4) { free(pt); return -1; }
         if (hlen >= dest_host_cap) { free(pt); return -1; }
         memcpy(dest_host_out, pt + off, hlen);
         dest_host_out[hlen] = '\0';
         off += hlen;
         *dest_port_out = get_u16(pt + off); off += 2;
 
-        uint16_t rid_len = get_u16(pt + off); off += 2;
-        if (rid_len >= recipient_id_cap) { free(pt); return -1; }
-        if (pt_len < off + rid_len + 4) { free(pt); return -1; }
-        memcpy(recipient_id_out, pt + off, rid_len);
-        recipient_id_out[rid_len] = '\0';
-        off += rid_len;
+        uint8_t dtyp = pt[off++];
+        if (deliver_type_out) *deliver_type_out = (pcomm_msg_type_t)dtyp;
 
-        uint32_t s_len = get_u32(pt + off); off += 4;
-        if (pt_len < off + s_len) { free(pt); return -1; }
+        uint32_t dlen = get_u32(pt + off); off += 4;
+        if (pt_len < off + dlen) { free(pt); return -1; }
 
-        uint8_t *s = (uint8_t*)malloc(s_len);
-        if (!s) { free(pt); return -1; }
-        memcpy(s, pt + off, s_len);
+        uint8_t *d = (uint8_t*)malloc(dlen);
+        if (!d) { free(pt); return -1; }
+        memcpy(d, pt + off, dlen);
 
-        *sealed_out = s;
-        *sealed_len_out = s_len;
+        if (deliver_payload_out) *deliver_payload_out = d;
+        if (deliver_len_out) *deliver_len_out = dlen;
         free(pt);
         return 0;
     }
