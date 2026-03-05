@@ -14,6 +14,8 @@ int pcomm_msg_pack_direct_text(uint32_t ts_unix, const char *sender_id, const ch
     size_t sid_len = strlen(sender_id);
     size_t tlen = strlen(text);
     if (sid_len > 90) return -1;
+
+    // ver(1) kind(1) ts(4) sid_len(2) sid text_len(4) text
     size_t len = 1 + 1 + 4 + 2 + sid_len + 4 + tlen;
     uint8_t *buf = (uint8_t*)malloc(len);
     if (!buf) return -1;
@@ -51,7 +53,7 @@ int pcomm_msg_pack_group_invite(uint32_t ts_unix, const char *sender_id,
         members_bytes += 2 + ml;
     }
 
-    // ver kind ts sid uuid title member_count(u16) members... bro wtf am I doing
+    // ver kind ts sid uuid title member_count(u16) members...
     size_t len = 1 + 1 + 4 + 2 + sid_len + 1 + uuid_len + 2 + title_len + 2 + members_bytes;
     uint8_t *buf = (uint8_t*)malloc(len);
     if (!buf) return -1;
@@ -163,7 +165,7 @@ int pcomm_msg_unpack_any(const uint8_t *buf, size_t len,
     if (len < 1 + 1 + 4 + 2) return -1;
 
     size_t off = 0;
-    off++;
+    off++; // ver
     uint8_t kind = buf[off++];
     *kind_out = (pcomm_plain_kind_t)kind;
 
@@ -226,6 +228,7 @@ int pcomm_msg_unpack_any(const uint8_t *buf, size_t len,
             *members_out_malloc = arr;
             *member_count_out = (int)mcount;
         } else {
+            // skip members
             for (uint16_t i = 0; i < mcount; i++) {
                 if (len < off + 2) return -1;
                 uint16_t ml = get_u16(buf + off); off += 2;

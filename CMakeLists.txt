@@ -10,6 +10,10 @@ add_executable(pcomm
     src/base32.c
     src/identity.c
     src/crypto.c
+    src/bencode.c
+    src/dht.c
+    src/cell.c
+    src/circuit.c
     src/db.c
     src/net.c
     src/proto.c

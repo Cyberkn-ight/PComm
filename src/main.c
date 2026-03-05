@@ -6,6 +6,8 @@
 #include "http.h"
 #include "mesh.h"
 #include "hidden.h"
+#include "dht.h"
+#include "circuit.h"
 
 #include <stdio.h>
 #include <signal.h>
@@ -59,7 +61,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Background network tasks
     pcomm_mesh_start(&cfg, &me, &db);
+    pcomm_dht_start(&cfg, &me, &db);
+    pcomm_circuits_start(&cfg, &me, &db);
     pcomm_hidden_start(&cfg, &me, &db);
 
     while (g_running) {

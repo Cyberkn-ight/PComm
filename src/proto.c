@@ -12,6 +12,7 @@ int pcomm_send_packet(int fd, pcomm_msg_type_t type, const uint8_t eph_pub[32], 
     memcpy(hdr, PCOMM_MAGIC, 4);
     hdr[4] = PCOMM_VERSION;
     hdr[5] = (uint8_t)type;
+    // hdr[6..7] reserved
 
     uint32_t nlen = htonl(payload_len);
     memcpy(hdr + 8, &nlen, 4);
@@ -54,5 +55,51 @@ int pcomm_recv_packet(int fd, pcomm_msg_type_t *type_out, uint8_t eph_pub_out[32
     }
 
     *payload_out = payload;
+    return 0;
+}
+
+int pcomm_pack_packet(pcomm_msg_type_t type, const uint8_t eph_pub[32], const uint8_t *payload, uint32_t payload_len,
+                      uint8_t **out, uint32_t *out_len) {
+    if (!out || !out_len) return -1;
+    *out = NULL; *out_len = 0;
+
+    uint32_t total = PCOMM_HDR_LEN + payload_len;
+    uint8_t *buf = (uint8_t*)malloc(total);
+    if (!buf) return -1;
+
+    memset(buf, 0, PCOMM_HDR_LEN);
+    memcpy(buf, PCOMM_MAGIC, 4);
+    buf[4] = PCOMM_VERSION;
+    buf[5] = (uint8_t)type;
+    uint32_t nlen = htonl(payload_len);
+    memcpy(buf + 8, &nlen, 4);
+    if (eph_pub) memcpy(buf + 12, eph_pub, 32);
+    if (payload_len && payload) memcpy(buf + PCOMM_HDR_LEN, payload, payload_len);
+
+    *out = buf;
+    *out_len = total;
+    return 0;
+}
+
+int pcomm_unpack_packet(const uint8_t *buf, uint32_t buf_len, pcomm_msg_type_t *type_out, uint8_t eph_pub_out[32],
+                        uint8_t **payload_out, uint32_t *payload_len_out) {
+    if (!buf || buf_len < PCOMM_HDR_LEN || !type_out || !payload_out || !payload_len_out) return -1;
+
+    if (memcmp(buf, PCOMM_MAGIC, 4) != 0) return -1;
+    if (buf[4] != PCOMM_VERSION) return -1;
+    *type_out = (pcomm_msg_type_t)buf[5];
+    uint32_t nlen;
+    memcpy(&nlen, buf + 8, 4);
+    uint32_t pl = ntohl(nlen);
+    if (PCOMM_HDR_LEN + pl != buf_len) return -1;
+    if (eph_pub_out) memcpy(eph_pub_out, buf + 12, 32);
+    uint8_t *payload = NULL;
+    if (pl > 0) {
+        payload = (uint8_t*)malloc(pl);
+        if (!payload) return -1;
+        memcpy(payload, buf + PCOMM_HDR_LEN, pl);
+    }
+    *payload_out = payload;
+    *payload_len_out = pl;
     return 0;
 }

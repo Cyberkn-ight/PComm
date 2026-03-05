@@ -65,6 +65,9 @@ int pcomm_onion_build_v1(const pcomm_peer_t *path, size_t path_len,
 
     size_t dest_host_len = strlen(dest_host);
     if (dest_host_len > 63) return -1;
+
+    // Innermost plaintext: DELIVER
+    // inst(1) flags(1) hostlen(1) host hostport(2) deliver_type(1) payload_len(4) payload
     uint8_t flags = (roundtrip != 0) ? 0x01 : 0x00;
     size_t pt0_len = 1 + 1 + 1 + dest_host_len + 2 + 1 + 4 + deliver_len;
     uint8_t *pt0 = (uint8_t*)malloc(pt0_len);
@@ -81,6 +84,7 @@ int pcomm_onion_build_v1(const pcomm_peer_t *path, size_t path_len,
     memcpy(pt0 + off, deliver_payload, deliver_len); off += deliver_len;
     if (off != pt0_len) { free(pt0); return -1; }
 
+    // Encrypt innermost for exit relay
     uint8_t *inner_blob = NULL;
     uint32_t inner_len = 0;
     {
@@ -105,11 +109,14 @@ int pcomm_onion_build_v1(const pcomm_peer_t *path, size_t path_len,
     }
     free(pt0);
 
+    // Wrap through relays in reverse.
     for (ssize_t i = (ssize_t)path_len - 2; i >= 0; i--) {
         const char *next_host = path[i+1].host;
         uint16_t next_port = path[i+1].port;
         size_t next_host_len = strlen(next_host);
         if (next_host_len > 63) { free(inner_blob); return -1; }
+
+        // inst(1) hostlen(1) host port(2) inner_len(4) inner
         uint8_t inst = (roundtrip != 0) ? (uint8_t)PCOMM_INST_FORWARD_RR : (uint8_t)PCOMM_INST_FORWARD;
         size_t pt_len = 1 + 1 + next_host_len + 2 + 4 + inner_len;
         uint8_t *pt = (uint8_t*)malloc(pt_len);

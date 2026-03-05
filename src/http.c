@@ -79,6 +79,7 @@ static int serve_file(int fd, const char *ui_dir, const char *req_path) {
     char path[1024];
     if (strcmp(req_path, "/") == 0) req_path = "/index.html";
 
+    // basic path traversal protection
     if (strstr(req_path, "..")) return send_resp(fd, 400, "text/plain", "bad path", 8);
 
     snprintf(path, sizeof(path), "%s%s", ui_dir, req_path);
@@ -190,11 +191,13 @@ static int api_conversations(http_state_t *st, int fd) {
 }
 
 static int api_messages(http_state_t *st, int fd, const char *query) {
+    // expect conv=<id>
     char conv_id_str[64] = {0};
     if (query) {
         const char *p = strstr(query, "conv=");
         if (p) {
             snprintf(conv_id_str, sizeof(conv_id_str), "%s", p + 5);
+            // strip after &
             char *amp = strchr(conv_id_str, '&');
             if (amp) *amp = '\0';
         }
@@ -250,9 +253,11 @@ static int api_send(http_state_t *st, int fd, const char *body) {
 
 static void trim(char *s) {
     if (!s) return;
+    // left
     char *p = s;
     while (*p && isspace((unsigned char)*p)) p++;
     if (p != s) memmove(s, p, strlen(p) + 1);
+    // right
     size_t n = strlen(s);
     while (n > 0 && isspace((unsigned char)s[n-1])) { s[n-1] = '\0'; n--; }
 }
@@ -276,6 +281,7 @@ static int api_create_group(http_state_t *st, int fd, const char *body) {
     trim(title);
     trim(members_raw);
 
+    // split by comma
     char *tmp = strdup(members_raw);
     if (!tmp) return send_resp(fd, 500, "text/plain", "oom", 3);
 
@@ -285,6 +291,7 @@ static int api_create_group(http_state_t *st, int fd, const char *body) {
     for (char *tok = strtok_r(tmp, ",", &save); tok && mcount < 64; tok = strtok_r(NULL, ",", &save)) {
         trim(tok);
         if (tok[0] == '\0') continue;
+        // validate ID format quickly (pubkey decode will validate more)
         uint8_t pk[32];
         if (pcomm_pubkey_from_user_id(tok, pk) != 0) continue;
         members[mcount++] = strdup(tok);
@@ -292,6 +299,7 @@ static int api_create_group(http_state_t *st, int fd, const char *body) {
     free(tmp);
     if (mcount == 0) return send_resp(fd, 400, "text/plain", "no valid members", 16);
 
+    // include self (if room)
     if (mcount < 65) members[mcount++] = strdup(st->me.user_id);
 
     uint8_t rnd[16];
@@ -308,6 +316,7 @@ static int api_create_group(http_state_t *st, int fd, const char *body) {
         pcomm_db_add_participant(st->db, conv_id, members[i]);
     }
 
+    // send invites to all other members
     for (int i = 0; i < mcount; i++) {
         if (strcmp(members[i], st->me.user_id) == 0) continue;
         pcomm_hidden_send_group_invite(st->db, &st->cfg, &st->me, members[i], uuid, title, members, mcount);
@@ -343,12 +352,14 @@ static int api_send_group(http_state_t *st, int fd, const char *body) {
         return send_resp(fd, 500, "text/plain", "db error", 8);
     }
 
+    // send to each member (except self)
     for (int i = 0; i < mcount; i++) {
         if (!members[i]) continue;
         if (strcmp(members[i], st->me.user_id) == 0) continue;
         pcomm_hidden_send_group_text(st->db, &st->cfg, &st->me, members[i], uuid, text);
     }
 
+    // store outbound locally
     pcomm_db_insert_message(st->db, conv_id, 1, uuid, st->me.user_id, text, (const uint8_t*)"", 0, (int64_t)time(NULL));
 
     for (int i = 0; i < mcount; i++) free(members[i]);
@@ -364,6 +375,7 @@ static int api_add_contact(http_state_t *st, int fd, const char *body) {
     char relay_str[8] = {0};
 
     if (form_get_field(body, "id", id, sizeof(id)) != 0) return send_resp(fd, 400, "text/plain", "missing id", 10);
+    // host/port are optional in the ID-only messaging model
     form_get_field(body, "host", host, sizeof(host));
     form_get_field(body, "port", port_str, sizeof(port_str));
     form_get_field(body, "relay", relay_str, sizeof(relay_str));
@@ -371,6 +383,7 @@ static int api_add_contact(http_state_t *st, int fd, const char *body) {
     uint16_t port = (uint16_t)atoi(port_str);
     int is_relay = (relay_str[0] == '1') ? 1 : 0;
 
+    // Extract pubkey from id
     uint8_t pubkey[32];
     if (pcomm_pubkey_from_user_id(id, pubkey) != 0) {
         return send_resp(fd, 400, "text/plain", "bad id", 6);
@@ -405,11 +418,13 @@ static void *http_thread(void *arg) {
         int cfd = net_accept(st->listen_fd, NULL, 0, NULL);
         if (cfd < 0) continue;
 
+        // read request headers
         char req[8192];
         ssize_t n = recv(cfd, req, sizeof(req) - 1, 0);
         if (n <= 0) { close(cfd); continue; }
         req[n] = '\0';
 
+        // split headers and body
         char *hdr_end = strstr(req, "\r\n\r\n");
         if (!hdr_end) { send_resp(cfd, 400, "text/plain", "bad request", 11); close(cfd); continue; }
 
@@ -417,6 +432,7 @@ static void *http_thread(void *arg) {
         char *body = req + header_len;
         size_t body_len = (size_t)n - header_len;
 
+        // parse request line
         char method[8] = {0};
         char target[1024] = {0};
         if (sscanf(req, "%7s %1023s", method, target) != 2) {
@@ -425,6 +441,7 @@ static void *http_thread(void *arg) {
             continue;
         }
 
+        // content-length
         size_t content_len = 0;
         const char *cl = strcasestr(req, "Content-Length:");
         if (cl) {
@@ -433,6 +450,7 @@ static void *http_thread(void *arg) {
             content_len = (size_t)atoi(cl);
         }
 
+        // if body incomplete, read rest (simple)
         while (body_len < content_len && header_len + body_len < sizeof(req) - 1) {
             ssize_t m = recv(cfd, req + n, (sizeof(req) - 1) - (size_t)n, 0);
             if (m <= 0) break;
@@ -448,6 +466,7 @@ static void *http_thread(void *arg) {
             continue;
         }
 
+        // path + query
         char path[1024] = {0};
         char *q = strchr(target, '?');
         const char *query = NULL;
@@ -461,6 +480,7 @@ static void *http_thread(void *arg) {
             snprintf(path, sizeof(path), "%s", target);
         }
 
+        // Ensure body is NUL terminated for form parsing
         char *body_copy = NULL;
         if (content_len > 0) {
             body_copy = (char*)malloc(content_len + 1);

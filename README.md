@@ -5,15 +5,16 @@ PComm is a **prototype** onion-relay messenger written in **pure C** with:
 - A minimal embedded **HTTP server** serving a barebone **HTML/CSS/JS UI**
 - **User identifiers** derived from an X25519 public key (self-certifying ID)
 - **E2E encryption** using X25519 + HKDF-SHA256 + ChaCha20-Poly1305
-- **Onion-style forwarding** (up to 3 hops) with optional **single-roundtrip** forwarding for mailbox polling
-- A Tor-inspired **intro/HSDir mailbox model**:
-  - users publish a small **descriptor** (intro points) to HSDirs
-  - senders deliver encrypted messages to a recipient mailbox **by ID only** (no recipient IP required)
-  - recipients poll mailboxes via onion-routed requests
+- **Long-lived circuits** (3 hops) with **stream multiplexing** (Tor-like RELAY BEGIN/DATA/END)
+- A Tor-inspired **intro + mailbox** model for messaging **by ID only** (no recipient IP required)
+  - users publish a small **descriptor** (intro points) onto a few storage relays
+  - storage relays announce themselves in a **BEP-5 DHT** under the user’s descriptor/mailbox infohash
+  - senders discover descriptor/mailbox hosts via DHT (`get_peers`) and deliver encrypted messages there
+  - recipients poll mailboxes via circuit-routed requests and store messages locally
 - A simple **mesh gossip** mechanism (HELLO + peer exchange) so new nodes can quickly learn relays
 - Lightweight **cover traffic** (NOOP onions) to make traffic less bursty
 
-> ⚠️ This is not production-ready anonymity software. It is missing many protections a real Tor implementation relies on (robust directory, guard policies, padding schedules, congestion control, DoS hardening, long-lived circuits, time-correlation defenses, etc.). Use for learning/testing only.
+> ⚠️ This is not production-ready anonymity software. It is missing many protections a real Tor implementation relies on (guards policy, robust padding, congestion control, DoS hardening, timing-correlation defenses, etc.). Use for learning/testing only.
 
 ## Build
 
@@ -74,7 +75,7 @@ PComm will:
 You can send to a user **just by their ID**:
 - add them to contacts (host/port optional), or just paste their ID into the send box
 - the sender encrypts E2E to the recipient public key (derived from the ID)
-- the encrypted blob is delivered to the recipient mailbox stored on HSDirs + (if available) intro points
+- the encrypted blob is delivered to the recipient mailbox stored on relays discovered via the BEP-5 DHT (with HSDir-style fallback)
 
 The recipient periodically polls those mailboxes and stores messages locally.
 

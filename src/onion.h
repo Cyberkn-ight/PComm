@@ -5,6 +5,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Onion payload format (at each hop): nonce(12) || AEAD(ciphertext)
+// The decrypted plaintext begins with a single-byte instruction.
+//
+// pcomm_onion_build_v1 builds an onion payload to route through `path` relays (path_len >= 1),
+// ending at the last relay (exit). The exit will connect to dest_host:dest_port and send
+// `deliver_type` with `deliver_payload`.
+//
+// If roundtrip != 0, all FORWARD layers are built as FORWARD_RR and the DELIVER layer carries
+// a flag that asks the exit to read a single response packet and return it along the chain.
 int pcomm_onion_build_v1(const pcomm_peer_t *path, size_t path_len,
                          const char *dest_host, uint16_t dest_port,
                          pcomm_msg_type_t deliver_type,
@@ -13,6 +22,11 @@ int pcomm_onion_build_v1(const pcomm_peer_t *path, size_t path_len,
                          uint8_t eph_pub_out[32],
                          uint8_t **onion_payload_out, uint32_t *onion_payload_len_out);
 
+// Unwrap at a relay.
+//
+// If inst_out is FORWARD or FORWARD_RR, next_host/next_port and next_payload are returned.
+// If inst_out is DELIVER, dest_host/dest_port, deliver_type, deliver_flags and deliver_payload are returned.
+// deliver_flags bit0 = expect response.
 int pcomm_onion_unwrap_v1(const uint8_t relay_priv[32], const uint8_t eph_pub[32],
                           const uint8_t *payload, uint32_t payload_len,
                           pcomm_inst_t *inst_out,
