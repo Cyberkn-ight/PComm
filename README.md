@@ -1,7 +1,5 @@
 # PComm (prototype)
 
-# PComm (prototype)
-
 PComm is a **prototype** as of rn, an onion-relay messenger written in pure C (the graph lies shhhhhh) with:
 - SQLite message storage (schema designed to extend to group chats later if I'm not too lazy)
 - A dogshit embedded HTTP server that serves a barebone HTML/CSS/JS UI
