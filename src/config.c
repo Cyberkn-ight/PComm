@@ -31,7 +31,7 @@ void pcomm_config_defaults(pcomm_config_t *cfg) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "PComm - the other one (prototype)\n\n"
+        "PComm - minimal onion-relay messenger (prototype)\n\n"
         "Usage: %s [options]\n\n"
         "Options:\n"
         "  --data-dir PATH     Data directory (default ./pcomm_data)\n"

@@ -47,6 +47,7 @@ int sb_appendf(sb_t *sb, const char *fmt, ...) {
     va_end(ap);
     if (n < 0) return -1;
     if ((size_t)n >= sizeof(tmp)) {
+        // big format: allocate exact
         char *big = (char*)malloc((size_t)n + 1);
         if (!big) return -1;
         va_start(ap, fmt);

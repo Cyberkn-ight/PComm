@@ -44,6 +44,7 @@ static int write_file_all_600(const char *path, const uint8_t *buf, size_t len) 
 int pcomm_user_id_from_pubkey(const uint8_t pubkey[32], char out[96]) {
     if (!pubkey || !out) return -1;
 
+    // payload: version(1) + pubkey(32) + checksum(4)
     uint8_t payload[1 + 32 + 4];
     payload[0] = 0x01;
     memcpy(payload + 1, pubkey, 32);
@@ -56,6 +57,7 @@ int pcomm_user_id_from_pubkey(const uint8_t pubkey[32], char out[96]) {
     int b32len = base32_encode_no_pad(payload, sizeof(payload), b32, sizeof(b32));
     if (b32len < 0) return -1;
 
+    // Prefix to make it recognizable.
     snprintf(out, 96, "pcomm1_%s", b32);
     return 0;
 }
@@ -103,6 +105,7 @@ int pcomm_identity_load_or_create(pcomm_identity_t *id, const char *data_dir) {
     if (!id || !data_dir) return -1;
     memset(id, 0, sizeof(*id));
 
+    // ensure data dir exists
     mkdir_p(data_dir);
 
     char key_path[1024];
@@ -116,6 +119,7 @@ int pcomm_identity_load_or_create(pcomm_identity_t *id, const char *data_dir) {
 
     if (read_file_all(key_path, id->privkey, 32) != 0) return -1;
 
+    // reconstruct EVP_PKEY to compute pubkey
     EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, id->privkey, 32);
     if (!pkey) return -1;
     size_t pub_len = 32;

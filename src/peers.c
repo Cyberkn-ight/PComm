@@ -13,6 +13,7 @@ int pcomm_load_peers_file(pcomm_db_t *db, const char *peers_path) {
     char line[512];
     int count = 0;
     while (fgets(line, sizeof(line), f)) {
+        // strip newline
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
         if (line[0] == '#' || line[0] == '\0') continue;

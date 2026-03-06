@@ -1,5 +1,7 @@
 # PComm (prototype)
 
+# PComm (prototype)
+
 PComm is a **prototype** as of rn, an onion-relay messenger written in pure C (the graph lies shhhhhh) with:
 - SQLite message storage (schema designed to extend to group chats later if I'm not too lazy)
 - A dogshit embedded HTTP server that serves a barebone HTML/CSS/JS UI
@@ -12,7 +14,6 @@ PComm is a **prototype** as of rn, an onion-relay messenger written in pure C (t
   - recipients poll mailboxes via onion-routed requests
 - A simple mesh gossip mechanism (HELLO + peer exchange) so new nodes can quickly learn relays
 - Lightweight cover traffic (NOOP onions) to make traffic less bursty
-
 
 It is inspired from my good friend [S3](https://github.com/S3NP41-v) [Pcomm project](https://github.com/S3NP41-v/PComm)
 
@@ -76,7 +77,7 @@ PComm will:
 You can send to a user just by their ID (yipeee):
 - add them to contacts (host/port optional), or just paste their ID into the send box
 - the sender encrypts E2E to the recipient public key (derived from the ID)
-- the encrypted blob is delivered to the recipient mailbox stored on HSDirs + (if available) intro points
+- the encrypted blob is delivered to the recipient mailbox stored on relays discovered via the BEP-5 DHT (with HSDir-style fallback)
 
 The recipient periodically polls those mailboxes and stores messages locally.
 
