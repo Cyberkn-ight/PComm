@@ -1,20 +1,19 @@
 # PComm (prototype)
 
-PComm is a **prototype** onion-relay messenger written in **pure C** with:
-- **SQLite** storage for chats (schema supports direct + group conversations)
-- A minimal embedded **HTTP server** serving a barebone **HTML/CSS/JS UI**
-- **User identifiers** derived from an X25519 public key (self-certifying ID)
-- **E2E encryption** using X25519 + HKDF-SHA256 + ChaCha20-Poly1305
-- **Long-lived circuits** (3 hops) with **stream multiplexing** (Tor-like RELAY BEGIN/DATA/END)
-- A Tor-inspired **intro + mailbox** model for messaging **by ID only** (no recipient IP required)
-  - users publish a small **descriptor** (intro points) onto a few storage relays
-  - storage relays announce themselves in a **BEP-5 DHT** under the user’s descriptor/mailbox infohash
-  - senders discover descriptor/mailbox hosts via DHT (`get_peers`) and deliver encrypted messages there
-  - recipients poll mailboxes via circuit-routed requests and store messages locally
-- A simple **mesh gossip** mechanism (HELLO + peer exchange) so new nodes can quickly learn relays
-- Lightweight **cover traffic** (NOOP onions) to make traffic less bursty
+# PComm (prototype)
 
-> ⚠️ This is not production-ready anonymity software. It is missing many protections a real Tor implementation relies on (guards policy, robust padding, congestion control, DoS hardening, timing-correlation defenses, etc.). Use for learning/testing only.
+PComm is a **prototype** as of rn, an onion-relay messenger written in pure C (the graph lies shhhhhh) with:
+- SQLite message storage (schema designed to extend to group chats later if I'm not too lazy)
+- A dogshit embedded HTTP server that serves a barebone HTML/CSS/JS UI
+- User identifiers derived from a Curve25519 (X25519) public key
+- E2E encryption using X25519 + HKDF-SHA256 + ChaCha20-Poly1305
+- Onion-style forwarding type shit through relay peers (3 max in this prototype for now)
+- A Tor-ripped-off intro/HSDir mailbox model:
+  - users publish a small descriptor (intro points) to HSDirs
+  - senders deliver encrypted messages to a recipient mailbox (no recipient IP required)
+  - recipients poll mailboxes via onion-routed requests
+- A simple mesh gossip mechanism (HELLO + peer exchange) so new nodes can quickly learn relays
+- Lightweight cover traffic (NOOP onions) to make traffic less bursty
 
 It is inspired from my good friend [S3](https://github.com/S3NP41-v) [Pcomm project](https://github.com/S3NP41-v/PComm)
 
