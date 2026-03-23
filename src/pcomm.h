@@ -38,6 +38,15 @@ typedef enum {
     PCOMM_RELAY_CONNECTED = 4,
     PCOMM_RELAY_DATA      = 5,
     PCOMM_RELAY_END       = 6,
+    // Hidden-service style rendezvous/intro (Tor-inspired)
+    PCOMM_RELAY_ESTABLISH_INTRO      = 7,
+    PCOMM_RELAY_INTRO_ESTABLISHED    = 8,
+    PCOMM_RELAY_INTRODUCE1           = 9,
+    PCOMM_RELAY_INTRODUCE_ACK        = 10,
+    PCOMM_RELAY_INTRODUCE2           = 11,
+    PCOMM_RELAY_ESTABLISH_RENDEZVOUS = 12,
+    PCOMM_RELAY_RENDEZVOUS1          = 13,
+    PCOMM_RELAY_RENDEZVOUS2          = 14,
 } pcomm_relay_cmd_t;
 
 // Onion instruction

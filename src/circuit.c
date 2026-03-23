@@ -42,6 +42,10 @@ struct pcomm_circuit {
     // very small stream map (prototype)
     stream_wait_t *streams[256]; // index by low byte
     int running;
+
+    // Optional callback for non-RPC relay events (hidden-service rendezvous, etc.)
+    pcomm_relay_event_cb event_cb;
+    void *event_cb_arg;
 };
 
 static pthread_t g_mgr_th;
@@ -198,15 +202,27 @@ static void *rx_loop(void *arg) {
                 if (pcomm_relay_plain_unpack(plain, plain_len, &rcmd, &sid, &body, &bl) == 0) {
                     pthread_mutex_lock(&c->mu);
                     stream_wait_t *w = c->streams[sid & 0xFF];
+                    pcomm_relay_event_cb cb = c->event_cb;
+                    void *cb_arg = c->event_cb_arg;
                     pthread_mutex_unlock(&c->mu);
+
+                    int consumed = 0;
                     if (w && w->id == sid) {
                         if (rcmd == PCOMM_RELAY_DATA) {
                             stream_deliver(w, body, bl, 0);
+                            consumed = 1;
                         } else if (rcmd == PCOMM_RELAY_END) {
                             stream_deliver(w, NULL, 0, 1);
+                            consumed = 1;
                         } else if (rcmd == PCOMM_RELAY_CONNECTED) {
-                            // ignore for now
+                            // optional; ignore for RPC waiters
+                            consumed = 1;
                         }
+                    }
+
+                    if (!consumed && cb) {
+                        // Callback may copy body if it needs to outlive this function.
+                        cb(cb_arg, c, rcmd, sid, body, bl);
                     }
                 }
                 free(plain);
@@ -382,9 +398,112 @@ pcomm_circuit_t *pcomm_circuit_get(void) {
 }
 
 static uint16_t alloc_stream_id(pcomm_circuit_t *c) {
+
     uint16_t sid = c->next_stream++;
     if (sid == 0) sid = c->next_stream++;
     return sid;
+}
+
+int pcomm_circuit_alloc_stream(pcomm_circuit_t *c, uint16_t *stream_id_out) {
+    if (!c || !stream_id_out) return -1;
+    pthread_mutex_lock(&c->mu);
+    uint16_t sid = alloc_stream_id(c);
+    pthread_mutex_unlock(&c->mu);
+    *stream_id_out = sid;
+    return 0;
+}
+
+int pcomm_circuit_set_event_cb(pcomm_circuit_t *c, pcomm_relay_event_cb cb, void *arg) {
+    if (!c) return -1;
+    pthread_mutex_lock(&c->mu);
+    c->event_cb = cb;
+    c->event_cb_arg = arg;
+    pthread_mutex_unlock(&c->mu);
+    return 0;
+}
+
+int pcomm_circuit_send_relay(pcomm_circuit_t *c, uint8_t relay_cmd, uint16_t stream_id,
+                            const uint8_t *body, uint16_t body_len) {
+    if (!c) return -1;
+    uint8_t *plain = NULL; uint16_t plain_len = 0;
+    if (pcomm_relay_plain_pack(relay_cmd, stream_id, body, body_len, &plain, &plain_len) != 0) return -1;
+    pthread_mutex_lock(&c->mu);
+    int rc = send_relay_plain_locked(c, plain, plain_len);
+    pthread_mutex_unlock(&c->mu);
+    free(plain);
+    return rc;
+}
+
+// Build a circuit with a chosen exit host:port. exclude_uid can be used to exclude our own user_id.
+pcomm_circuit_t *pcomm_circuit_create_to_exit(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db,
+                                              const char *exit_host, uint16_t exit_port,
+                                              const char *exclude_uid) {
+    if (!cfg || !me || !db || !exit_host || exit_port == 0) return NULL;
+
+    // Pick up to 2 random relays for guard/middle, excluding exit and exclude_uid.
+    pcomm_peer_t hops[PCOMM_MAX_HOPS];
+    size_t n = 0;
+
+    // Query random relays
+    const char *sql =
+        "SELECT user_id, host, port, pubkey FROM contacts "
+        "WHERE is_relay=1 AND host!='' AND port>0 "
+        "AND user_id != ? AND NOT (host = ? AND port = ?) "
+        "ORDER BY RANDOM() LIMIT 2;";
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &st, NULL) != SQLITE_OK) return NULL;
+    sqlite3_bind_text(st, 1, exclude_uid ? exclude_uid : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, exit_host, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, (int)exit_port);
+
+    while (sqlite3_step(st) == SQLITE_ROW && n < 2) {
+        const char *uid = (const char*)sqlite3_column_text(st, 0);
+        const char *host = (const char*)sqlite3_column_text(st, 1);
+        int port = sqlite3_column_int(st, 2);
+        const void *pk = sqlite3_column_blob(st, 3);
+        int pklen = sqlite3_column_bytes(st, 3);
+        if (!uid || !host || pklen != 32 || port <= 0 || port > 65535) continue;
+        memset(&hops[n], 0, sizeof(hops[n]));
+        snprintf(hops[n].user_id, sizeof(hops[n].user_id), "%s", uid);
+        snprintf(hops[n].host, sizeof(hops[n].host), "%s", host);
+        hops[n].port = (uint16_t)port;
+        memcpy(hops[n].pubkey, pk, 32);
+        n++;
+    }
+    sqlite3_finalize(st);
+
+    // Exit hop
+    pcomm_peer_t exitp; memset(&exitp, 0, sizeof(exitp));
+    snprintf(exitp.user_id, sizeof(exitp.user_id), "%s", "");
+    snprintf(exitp.host, sizeof(exitp.host), "%s", exit_host);
+    exitp.port = exit_port;
+    // pubkey optional for this prototype.
+
+    if (n == 0) {
+        hops[0] = exitp;
+        n = 1;
+    } else if (n == 1) {
+        hops[1] = exitp;
+        n = 2;
+    } else {
+        hops[2] = exitp;
+        n = 3;
+    }
+
+    pcomm_circuit_t *c = (pcomm_circuit_t*)calloc(1, sizeof(pcomm_circuit_t));
+    if (!c) return NULL;
+    if (circuit_build(c, hops, n) != 0) {
+        circuit_free(c);
+        return NULL;
+    }
+    (void)cfg;
+    (void)me;
+    return c;
+}
+
+void pcomm_circuit_close(pcomm_circuit_t *c) {
+    circuit_free(c);
 }
 
 int pcomm_circuit_rpc(pcomm_circuit_t *c,

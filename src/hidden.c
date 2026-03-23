@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 
@@ -43,19 +44,205 @@ static void sha256_key(const char *tag, const char *user_id, uint32_t epoch, uin
     SHA256_Final(out, &ctx);
 }
 
+typedef struct rdv_wait rdv_wait_t;
+typedef struct rdv_sess rdv_sess_t;
+
+typedef struct {
+    pcomm_peer_t intro;
+    pcomm_circuit_t *circ; // long-lived circuit to intro point
+} intro_circ_t;
+
+struct rdv_wait {
+    uint8_t cookie[20];
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int done;
+    int ok;
+    rdv_wait_t *next;
+};
+
+struct rdv_sess {
+    char peer_id[96];
+    uint8_t cookie[20];
+    pcomm_circuit_t *circ; // circuit to rendezvous point
+    time_t last_used;
+    int established;
+    rdv_sess_t *next;
+};
+
 typedef struct {
     pcomm_config_t cfg;
     pcomm_identity_t me;
     pcomm_db_t *db;
 
-    // cached intro points from last publish
+    // cached intro points from last publish (also published in descriptor blob)
     pcomm_peer_t intros[3];
     size_t intro_count;
+
+    // long-lived intro circuits (one per intro point)
+    intro_circ_t intro_circs[3];
+
+    // rendezvous waits/sessions
+    pthread_mutex_t rdv_mu;
+    rdv_wait_t *waits;
+    rdv_sess_t *sessions;
 
     pthread_mutex_t lock;
 } hidden_state_t;
 
 static hidden_state_t *g_hidden = NULL;
+
+static void rdv_wait_init(rdv_wait_t *w, const uint8_t cookie[20]) {
+    memset(w, 0, sizeof(*w));
+    memcpy(w->cookie, cookie, 20);
+    pthread_mutex_init(&w->mu, NULL);
+    pthread_cond_init(&w->cv, NULL);
+}
+
+static void rdv_wait_destroy(rdv_wait_t *w) {
+    pthread_mutex_destroy(&w->mu);
+    pthread_cond_destroy(&w->cv);
+}
+
+static void rdv_signal(hidden_state_t *st, const uint8_t cookie[20], int ok) {
+    pthread_mutex_lock(&st->rdv_mu);
+    for (rdv_wait_t *w = st->waits; w; w = w->next) {
+        if (memcmp(w->cookie, cookie, 20) == 0) {
+            pthread_mutex_lock(&w->mu);
+            w->ok = ok;
+            w->done = 1;
+            pthread_cond_broadcast(&w->cv);
+            pthread_mutex_unlock(&w->mu);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&st->rdv_mu);
+}
+
+static void rdv_wait_add(hidden_state_t *st, rdv_wait_t *w) {
+    pthread_mutex_lock(&st->rdv_mu);
+    w->next = st->waits;
+    st->waits = w;
+    pthread_mutex_unlock(&st->rdv_mu);
+}
+
+static void rdv_wait_remove(hidden_state_t *st, rdv_wait_t *w) {
+    pthread_mutex_lock(&st->rdv_mu);
+    rdv_wait_t **pp = &st->waits;
+    while (*pp) {
+        if (*pp == w) {
+            *pp = w->next;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&st->rdv_mu);
+}
+
+
+static rdv_sess_t *rdv_find_session(hidden_state_t *st, const char *peer_id) {
+    time_t now = time(NULL);
+    rdv_sess_t *best = NULL;
+    pthread_mutex_lock(&st->rdv_mu);
+    for (rdv_sess_t *s = st->sessions; s; s = s->next) {
+        if (peer_id && peer_id[0] && strcmp(s->peer_id, peer_id) == 0) {
+            // expire after 2 minutes idle
+            if ((now - s->last_used) < 120) best = s;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&st->rdv_mu);
+    return best;
+}
+
+static void rdv_add_or_update_session(hidden_state_t *st, const char *peer_id, const uint8_t cookie[20], pcomm_circuit_t *circ) {
+    pthread_mutex_lock(&st->rdv_mu);
+    rdv_sess_t *s = st->sessions;
+    while (s) {
+        if (strcmp(s->peer_id, peer_id) == 0) {
+            memcpy(s->cookie, cookie, 20);
+            if (s->circ && s->circ != circ) {
+                pcomm_circuit_close(s->circ);
+            }
+            s->circ = circ;
+            s->last_used = time(NULL);
+            s->established = 0;
+            pthread_mutex_unlock(&st->rdv_mu);
+            return;
+        }
+        s = s->next;
+    }
+    rdv_sess_t *ns = (rdv_sess_t*)calloc(1, sizeof(rdv_sess_t));
+    if (!ns) { pthread_mutex_unlock(&st->rdv_mu); return; }
+    snprintf(ns->peer_id, sizeof(ns->peer_id), "%s", peer_id);
+    memcpy(ns->cookie, cookie, 20);
+    ns->circ = circ;
+    ns->last_used = time(NULL);
+    ns->established = 0;
+    ns->next = st->sessions;
+    st->sessions = ns;
+    pthread_mutex_unlock(&st->rdv_mu);
+}
+
+static void rdv_mark_established(hidden_state_t *st, const uint8_t cookie[20]) {
+    pthread_mutex_lock(&st->rdv_mu);
+    for (rdv_sess_t *s = st->sessions; s; s = s->next) {
+        if (memcmp(s->cookie, cookie, 20) == 0) {
+            s->established = 1;
+            s->last_used = time(NULL);
+        }
+    }
+    pthread_mutex_unlock(&st->rdv_mu);
+}
+
+// Handle an incoming sealed DELIVER payload (same as mailbox items).
+static void process_sealed_message(hidden_state_t *st, const uint8_t *sealed, uint32_t sealed_len, uint32_t fallback_ts) {
+    uint8_t *plain = NULL; size_t plain_len = 0;
+    if (pcomm_open_seal(st->me.privkey, sealed, sealed_len, &plain, &plain_len) != 0) return;
+
+    pcomm_plain_kind_t kind;
+    uint32_t mts = 0;
+    char sender[96] = {0};
+    char group_uuid[64] = {0};
+    char *title = NULL;
+    char **members = NULL; int member_count = 0;
+    char *text = NULL;
+
+    if (pcomm_msg_unpack_any(plain, plain_len, &kind, &mts, sender, sizeof(sender),
+                             group_uuid, sizeof(group_uuid),
+                             &title, &members, &member_count, &text) == 0) {
+        uint32_t ts = mts ? mts : fallback_ts;
+        if (kind == PCOMM_PLAIN_DIRECT_TEXT) {
+            int64_t conv_id = pcomm_db_get_or_create_direct_conv(st->db, sender);
+            if (conv_id >= 0) {
+                pcomm_db_insert_message(st->db, conv_id, 0, sender, sender, text ? text : "", sealed, sealed_len, (int64_t)ts);
+            }
+        } else if (kind == PCOMM_PLAIN_GROUP_INVITE) {
+            int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, title ? title : "");
+            if (conv_id >= 0) {
+                for (int k = 0; k < member_count; k++) pcomm_db_add_participant(st->db, conv_id, members[k]);
+                const char *body = title ? title : "Group invite";
+                pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, body, sealed, sealed_len, (int64_t)ts);
+            }
+        } else if (kind == PCOMM_PLAIN_GROUP_TEXT) {
+            int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, NULL);
+            if (conv_id >= 0) {
+                pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, text ? text : "", sealed, sealed_len, (int64_t)ts);
+            }
+        }
+    }
+
+    free(plain);
+    free(title);
+    pcomm_msg_free_members(members, member_count);
+    free(text);
+}
+
+// circuit event callback: handles INTRODUCE2, RENDEZVOUS2, and rendezvous DATA cells.
+static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
+                                 uint8_t relay_cmd, uint16_t stream_id,
+                                 const uint8_t *body, uint16_t body_len);
+
 
 // Load a random onion path (0..3 relays) excluding specific IDs.
 static int load_onion_relays(pcomm_db_t *db, const char *ex1, const char *ex2, const char *ex3, pcomm_peer_t *out, size_t out_cap, size_t *out_len) {
@@ -92,6 +279,41 @@ static int load_onion_relays(pcomm_db_t *db, const char *ex1, const char *ex2, c
     sqlite3_finalize(st);
     return 0;
 }
+
+static int pick_random_relay(pcomm_db_t *db, const char *ex1, const char *ex2, const char *ex3, pcomm_peer_t *out) {
+    if (!db || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    const char *sql =
+        "SELECT user_id, host, port, pubkey FROM contacts "
+        "WHERE is_relay=1 AND host!='' AND port>0 "
+        "AND user_id != ? AND user_id != ? AND user_id != ? "
+        "ORDER BY RANDOM() LIMIT 1;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(st, 1, ex1 ? ex1 : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, ex2 ? ex2 : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, ex3 ? ex3 : "", -1, SQLITE_TRANSIENT);
+
+    int rc = -1;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *uid = (const char*)sqlite3_column_text(st, 0);
+        const char *host = (const char*)sqlite3_column_text(st, 1);
+        int port = sqlite3_column_int(st, 2);
+        const void *pk = sqlite3_column_blob(st, 3);
+        int pklen = sqlite3_column_bytes(st, 3);
+        if (uid && host && pklen == 32 && port > 0 && port <= 65535) {
+            snprintf(out->user_id, sizeof(out->user_id), "%s", uid);
+            snprintf(out->host, sizeof(out->host), "%s", host);
+            out->port = (uint16_t)port;
+            memcpy(out->pubkey, pk, 32);
+            rc = 0;
+        }
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+
 
 // List all known relays (cap limited)
 static int list_all_relays(pcomm_db_t *db, pcomm_peer_t **out, size_t *out_len) {
@@ -518,6 +740,92 @@ static int publish_descriptor(hidden_state_t *st) {
     return 0;
 }
 
+
+static int ensure_intro_circuits(hidden_state_t *st) {
+    if (!st) return -1;
+
+    pthread_mutex_lock(&st->lock);
+    size_t n = st->intro_count;
+    pcomm_peer_t intros[3];
+    for (size_t i = 0; i < n && i < 3; i++) intros[i] = st->intros[i];
+    pthread_mutex_unlock(&st->lock);
+
+    for (size_t i = 0; i < n && i < 3; i++) {
+        intro_circ_t *ic = &st->intro_circs[i];
+        int need_new = 1;
+        if (ic->circ && strcmp(ic->intro.host, intros[i].host) == 0 && ic->intro.port == intros[i].port) {
+            need_new = 0;
+        } else {
+            if (ic->circ) {
+                pcomm_circuit_close(ic->circ);
+                ic->circ = NULL;
+            }
+        }
+
+        ic->intro = intros[i];
+
+        if (need_new) {
+            ic->circ = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, ic->intro.host, ic->intro.port, st->me.user_id);
+            if (!ic->circ) continue;
+            pcomm_circuit_set_event_cb(ic->circ, hidden_circuit_event, st);
+        }
+
+        // Send ESTABLISH_INTRO each time (idempotent on intro point)
+        uint8_t body[1 + 96];
+        size_t sidlen = strlen(st->me.user_id);
+        if (sidlen > 95) sidlen = 95;
+        body[0] = (uint8_t)sidlen;
+        memcpy(body + 1, st->me.user_id, sidlen);
+
+        pcomm_circuit_send_relay(ic->circ, PCOMM_RELAY_ESTABLISH_INTRO, 0, body, (uint16_t)(1 + sidlen));
+    }
+
+    // close unused slots
+    for (size_t j = n; j < 3; j++) {
+        if (st->intro_circs[j].circ) {
+            pcomm_circuit_close(st->intro_circs[j].circ);
+            st->intro_circs[j].circ = NULL;
+            memset(&st->intro_circs[j].intro, 0, sizeof(st->intro_circs[j].intro));
+        }
+    }
+
+    return 0;
+}
+
+static int handle_introduce2(hidden_state_t *st, const uint8_t *body, uint16_t bl) {
+    if (!st || !body) return -1;
+    // body: client_id_len(1) client_id cookie(20) rp_host_len(1) rp_host rp_port(2)
+    if (bl < 1 + 20 + 1 + 2) return -1;
+    size_t off = 0;
+    uint8_t cl = body[off++];
+    if (cl == 0 || cl > 95 || bl < off + cl + 20 + 1 + 2) return -1;
+    char client_id[96];
+    memcpy(client_id, body + off, cl); client_id[cl] = '\0';
+    off += cl;
+
+    uint8_t cookie[20];
+    memcpy(cookie, body + off, 20); off += 20;
+
+    uint8_t hl = body[off++];
+    if (hl == 0 || hl > 63 || bl < off + hl + 2) return -1;
+    char rphost[64];
+    memcpy(rphost, body + off, hl); rphost[hl] = '\0';
+    off += hl;
+    uint16_t rpport = get_u16(body + off); off += 2;
+
+    // Create a dedicated circuit to the rendezvous point and send RENDEZVOUS1(cookie)
+    pcomm_circuit_t *rc = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, rphost, rpport, st->me.user_id);
+    if (!rc) return -1;
+    pcomm_circuit_set_event_cb(rc, hidden_circuit_event, st);
+
+    rdv_add_or_update_session(st, client_id, cookie, rc);
+
+    // RENDEZVOUS1 body: cookie(20)
+    pcomm_circuit_send_relay(rc, PCOMM_RELAY_RENDEZVOUS1, 0, cookie, 20);
+    return 0;
+}
+
+
 static int parse_mb_resp_items(hidden_state_t *st, const uint8_t *payload, uint32_t payload_len) {
     if (!payload || payload_len < 1 + 2) return -1;
     uint32_t off = 0;
@@ -649,6 +957,7 @@ static void *publish_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
     for (;;) {
         publish_descriptor(st);
+        ensure_intro_circuits(st);
         sleep(10 * 60);
     }
     return NULL;
@@ -695,6 +1004,46 @@ static void *cover_thread(void *arg) {
     return NULL;
 }
 
+
+static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
+                                 uint8_t relay_cmd, uint16_t stream_id,
+                                 const uint8_t *body, uint16_t body_len) {
+    (void)c;
+    hidden_state_t *st = (hidden_state_t*)arg;
+    if (!st) return;
+
+    if (relay_cmd == PCOMM_RELAY_INTRODUCE2) {
+        handle_introduce2(st, body, (uint16_t)body_len);
+        return;
+    }
+
+    if (relay_cmd == PCOMM_RELAY_RENDEZVOUS2) {
+        // body: cookie(20) status(1)
+        if (body_len >= 21) {
+            const uint8_t *cookie = body;
+            int ok = body[20] ? 1 : 0;
+            rdv_signal(st, cookie, ok);
+            if (ok) rdv_mark_established(st, cookie);
+        }
+        return;
+    }
+
+    // Rendezvous payload: packed PComm packet carried in RELAY_DATA on an unknown stream.
+    if (relay_cmd == PCOMM_RELAY_DATA && body && body_len >= PCOMM_HDR_LEN) {
+        pcomm_msg_type_t mt;
+        uint8_t eph[32];
+        uint8_t *pl = NULL; uint32_t pll = 0;
+        if (pcomm_unpack_packet(body, (uint32_t)body_len, &mt, eph, &pl, &pll) == 0) {
+            if (mt == PCOMM_MSG_DELIVER && pl && pll > 0) {
+                process_sealed_message(st, pl, pll, (uint32_t)time(NULL));
+            }
+            free(pl);
+        }
+        (void)stream_id;
+        return;
+    }
+}
+
 int pcomm_hidden_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db) {
     if (!cfg || !me || !db) return -1;
 
@@ -704,6 +1053,9 @@ int pcomm_hidden_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pc
     st->me = *me;
     st->db = db;
     pthread_mutex_init(&st->lock, NULL);
+    pthread_mutex_init(&st->rdv_mu, NULL);
+    st->waits = NULL;
+    st->sessions = NULL;
 
     g_hidden = st;
 
@@ -774,6 +1126,126 @@ int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const p
     return ok;
 }
 
+
+static int rdv_send_over_session(hidden_state_t *st, rdv_sess_t *sess, const uint8_t *sealed, size_t sealed_len) {
+    if (!st || !sess || !sess->circ || !sealed || sealed_len == 0) return -1;
+    if (!sess->established) return -1;
+
+    uint8_t *pkt = NULL; uint32_t pkt_len = 0;
+    if (pcomm_pack_packet(PCOMM_MSG_DELIVER, NULL, sealed, (uint32_t)sealed_len, &pkt, &pkt_len) != 0) return -1;
+
+    uint16_t sid = 0;
+    pcomm_circuit_alloc_stream(sess->circ, &sid);
+    // send DELIVER packet in RELAY_DATA; end the stream to keep state small
+    pcomm_circuit_send_relay(sess->circ, PCOMM_RELAY_DATA, sid, pkt, (uint16_t)pkt_len);
+    pcomm_circuit_send_relay(sess->circ, PCOMM_RELAY_END, sid, NULL, 0);
+    free(pkt);
+
+    pthread_mutex_lock(&st->rdv_mu);
+    sess->last_used = time(NULL);
+    pthread_mutex_unlock(&st->rdv_mu);
+    return 0;
+}
+
+static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, const uint8_t *sealed, size_t sealed_len) {
+    if (!st || !service_id || !sealed || sealed_len == 0) return -1;
+
+    uint32_t ep = epoch_now();
+
+    // 1) fetch descriptor to get intro points
+    pcomm_peer_t intros[3]; size_t intro_n = 0;
+    if (fetch_descriptor(st->db, &st->cfg, &st->me, service_id, ep, intros, 3, &intro_n) != 0 || intro_n == 0) {
+        return -1;
+    }
+
+    // 2) pick a rendezvous point (random relay)
+    pcomm_peer_t rp;
+    if (pick_random_relay(st->db, st->me.user_id, intros[0].user_id, service_id, &rp) != 0) {
+        // fallback: use intro as rendezvous (not ideal, but keeps functionality)
+        rp = intros[0];
+    }
+
+    uint8_t cookie[20];
+    pcomm_random(cookie, 20);
+
+    // 3) build circuit to rendezvous point
+    pcomm_circuit_t *rp_c = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, rp.host, rp.port, st->me.user_id);
+    if (!rp_c) return -1;
+    pcomm_circuit_set_event_cb(rp_c, hidden_circuit_event, st);
+
+    // 4) wait object for RENDEZVOUS2
+    rdv_wait_t w;
+    rdv_wait_init(&w, cookie);
+    rdv_wait_add(st, &w);
+
+    // 5) ESTABLISH_RENDEZVOUS(cookie)
+    pcomm_circuit_send_relay(rp_c, PCOMM_RELAY_ESTABLISH_RENDEZVOUS, 0, cookie, 20);
+
+    // 6) circuit to intro point, send INTRODUCE1(service_id, client_id, cookie, rp host/port)
+    pcomm_circuit_t *intro_c = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, intros[0].host, intros[0].port, st->me.user_id);
+    if (intro_c) {
+        // body: service_len service client_len client cookie rp_host_len rp_host rp_port
+        uint8_t body[1 + 95 + 1 + 95 + 20 + 1 + 63 + 2];
+        size_t off = 0;
+        size_t sl = strlen(service_id); if (sl > 95) sl = 95;
+        size_t cl = strlen(st->me.user_id); if (cl > 95) cl = 95;
+        size_t hl = strlen(rp.host); if (hl > 63) hl = 63;
+
+        body[off++] = (uint8_t)sl;
+        memcpy(body + off, service_id, sl); off += sl;
+        body[off++] = (uint8_t)cl;
+        memcpy(body + off, st->me.user_id, cl); off += cl;
+        memcpy(body + off, cookie, 20); off += 20;
+        body[off++] = (uint8_t)hl;
+        memcpy(body + off, rp.host, hl); off += hl;
+        put_u16(body + off, rp.port); off += 2;
+
+        pcomm_circuit_send_relay(intro_c, PCOMM_RELAY_INTRODUCE1, 0, body, (uint16_t)off);
+        pcomm_circuit_close(intro_c);
+    }
+
+    // 7) wait up to ~8 seconds
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 8;
+
+    pthread_mutex_lock(&w.mu);
+    while (!w.done) {
+        if (pthread_cond_timedwait(&w.cv, &w.mu, &ts) == ETIMEDOUT) break;
+    }
+    int ok = w.ok;
+    pthread_mutex_unlock(&w.mu);
+
+    rdv_wait_remove(st, &w);
+    rdv_wait_destroy(&w);
+
+    if (!ok) {
+        pcomm_circuit_close(rp_c);
+        return -1;
+    }
+
+    // 8) register session and send
+    rdv_add_or_update_session(st, service_id, cookie, rp_c);
+    rdv_mark_established(st, cookie);
+
+    rdv_sess_t *sess = rdv_find_session(st, service_id);
+    if (!sess) {
+        pcomm_circuit_close(rp_c);
+        return -1;
+    }
+    return rdv_send_over_session(st, sess, sealed, sealed_len);
+}
+
+static int rdv_try_send(hidden_state_t *st, const char *to_user_id, const uint8_t *sealed, size_t sealed_len) {
+    if (!st) return -1;
+    rdv_sess_t *sess = rdv_find_session(st, to_user_id);
+    if (sess && sess->circ && sess->established) {
+        if (rdv_send_over_session(st, sess, sealed, sealed_len) == 0) return 0;
+    }
+    // no session or failed: try creating one
+    return rdv_connect_and_send(st, to_user_id, sealed, sealed_len);
+}
+
 int pcomm_hidden_send_direct_text(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
                                  const char *to_user_id, const char *text) {
     if (!db || !cfg || !me || !to_user_id || !text) return -1;
@@ -797,7 +1269,13 @@ int pcomm_hidden_send_direct_text(pcomm_db_t *db, const pcomm_config_t *cfg, con
     }
     free(plain);
 
-    int send_rc = pcomm_hidden_mailbox_send(db, cfg, me, to_user_id, sealed, sealed_len);
+    int send_rc = -1;
+    if (g_hidden) {
+        send_rc = rdv_try_send(g_hidden, to_user_id, sealed, sealed_len);
+    }
+    if (send_rc != 0) {
+        send_rc = pcomm_hidden_mailbox_send(db, cfg, me, to_user_id, sealed, sealed_len);
+    }
 
     // Store outbound (direct)
     int64_t conv_id = pcomm_db_get_or_create_direct_conv(db, to_user_id);

@@ -25,4 +25,29 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
                       pcomm_msg_type_t *resp_type_out,
                       uint8_t **resp_payload_out, uint32_t *resp_payload_len_out);
 
+
+typedef void (*pcomm_relay_event_cb)(void *arg, pcomm_circuit_t *c,
+                                     uint8_t relay_cmd, uint16_t stream_id,
+                                     const uint8_t *body, uint16_t body_len);
+
+// Create a dedicated circuit whose exit hop is (exit_host:exit_port). Useful for hidden-service
+// intro/rendezvous circuits. The circuit runs its own RX thread.
+// Returns owned pointer; free with pcomm_circuit_close().
+pcomm_circuit_t *pcomm_circuit_create_to_exit(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db,
+                                              const char *exit_host, uint16_t exit_port,
+                                              const char *exclude_uid);
+
+// Close and free a dedicated circuit created with pcomm_circuit_create_to_exit.
+void pcomm_circuit_close(pcomm_circuit_t *c);
+
+// Set an optional callback invoked for RELAY cells that are not consumed by an RPC waiter.
+int pcomm_circuit_set_event_cb(pcomm_circuit_t *c, pcomm_relay_event_cb cb, void *arg);
+
+// Send a raw RELAY command over the circuit (stream_id is caller-chosen; 0 recommended for control).
+int pcomm_circuit_send_relay(pcomm_circuit_t *c, uint8_t relay_cmd, uint16_t stream_id,
+                            const uint8_t *body, uint16_t body_len);
+
+// Allocate a new stream id (for custom uses like rendezvous data streams).
+int pcomm_circuit_alloc_stream(pcomm_circuit_t *c, uint16_t *stream_id_out);
+
 #endif
