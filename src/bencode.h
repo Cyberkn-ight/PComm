@@ -30,17 +30,10 @@ struct benc {
     size_t dict_len;
 };
 
-// Parse bencode. Returns 0 on success.
 int benc_parse(const uint8_t *buf, size_t len, benc_t **out, size_t *used);
 void benc_free(benc_t *n);
-
-// Dict helpers
 benc_t *benc_dict_get(benc_t *d, const char *key);
-
-// Encode bencode. Allocates *out; caller frees.
 int benc_encode(const benc_t *n, uint8_t **out, size_t *out_len);
-
-// Convenience constructors (allocated nodes)
 benc_t *benc_new_int(int64_t v);
 benc_t *benc_new_str(const uint8_t *s, size_t slen);
 benc_t *benc_new_list(void);

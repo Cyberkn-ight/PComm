@@ -14,13 +14,11 @@ void pcomm_db_close(pcomm_db_t *pdb);
 
 int pcomm_db_init_schema(pcomm_db_t *pdb);
 
-// Contacts (relays + friends)
 int pcomm_db_upsert_contact(pcomm_db_t *pdb, const char *user_id, const char *host, uint16_t port,
                             const uint8_t pubkey[32], int is_relay);
 int pcomm_db_get_contact(pcomm_db_t *pdb, const char *user_id, char *host_out, size_t host_cap,
                          uint16_t *port_out, uint8_t pubkey_out[32], int *is_relay_out);
 
-// Conversations / messages
 int64_t pcomm_db_get_or_create_direct_conv(pcomm_db_t *pdb, const char *peer_user_id);
 
 int pcomm_db_insert_message(pcomm_db_t *pdb, int64_t conv_id, int direction, const char *peer_user_id,
@@ -28,7 +26,6 @@ int pcomm_db_insert_message(pcomm_db_t *pdb, int64_t conv_id, int direction, con
                             const uint8_t *cipher, size_t cipher_len,
                             int64_t ts_unix);
 
-// Group support helpers
 int64_t pcomm_db_get_or_create_group_conv(pcomm_db_t *pdb, const char *uuid, const char *title);
 int pcomm_db_add_participant(pcomm_db_t *pdb, int64_t conv_id, const char *user_id);
 int pcomm_db_get_conversation_uuid(pcomm_db_t *pdb, int64_t conv_id,
@@ -36,18 +33,15 @@ int pcomm_db_get_conversation_uuid(pcomm_db_t *pdb, int64_t conv_id,
                                   char *type_out, size_t type_cap);
 int pcomm_db_list_group_participants(pcomm_db_t *pdb, int64_t conv_id, char ***ids_out, int *count_out);
 
-// Relay mailbox / descriptor storage (used when acting as a relay).
 int pcomm_db_mailbox_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *blob, uint32_t blob_len, int64_t ts_unix);
 int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], uint8_t **out, uint32_t *out_len);
 int pcomm_db_desc_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *blob, uint32_t blob_len,
                       int64_t expires_unix, int64_t ts_unix);
 int pcomm_db_desc_get(pcomm_db_t *pdb, const uint8_t key[32], uint8_t **blob_out, uint32_t *blob_len_out);
 
-// Small settings KV store (for guard selection, etc.).
 int pcomm_db_kv_set(pcomm_db_t *pdb, const char *key, const char *value);
 int pcomm_db_kv_get(pcomm_db_t *pdb, const char *key, char *value_out, size_t value_cap);
 
-// Persist DHT routing table nodes for better bootstrapping.
 int pcomm_db_dhtnode_upsert(pcomm_db_t *pdb,
                             const uint8_t node_id[20],
                             const char *host,

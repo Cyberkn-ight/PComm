@@ -43,7 +43,6 @@ int pcomm_db_open(pcomm_db_t *pdb, const char *data_dir) {
     }
     sqlite3_busy_timeout(pdb->db, 2000);
 
-    // enforce foreign keys
     exec_sql(pdb->db, "PRAGMA foreign_keys=ON;");
     return 0;
 }
@@ -69,7 +68,7 @@ int pcomm_db_init_schema(pcomm_db_t *pdb) {
         "CREATE TABLE IF NOT EXISTS conversations("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " uuid TEXT,"
-        " type TEXT NOT NULL," // 'direct' or 'group'
+        " type TEXT NOT NULL,"
         " title TEXT,"
         " created_at INTEGER NOT NULL"
         ");"
@@ -84,8 +83,8 @@ int pcomm_db_init_schema(pcomm_db_t *pdb) {
         "CREATE TABLE IF NOT EXISTS messages("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " conversation_id INTEGER NOT NULL,"
-        " direction INTEGER NOT NULL," // 0=in, 1=out
-        " peer_user_id TEXT NOT NULL," // other party for direct chats
+        " direction INTEGER NOT NULL,"
+        " peer_user_id TEXT NOT NULL,"
         " sender_user_id TEXT NOT NULL,"
         " body TEXT NOT NULL,"
         " ciphertext BLOB NOT NULL,"
@@ -97,13 +96,11 @@ int pcomm_db_init_schema(pcomm_db_t *pdb) {
 
     if (exec_sql(pdb->db, sql) != 0) return -1;
 
-    // Migrations for older databases
     if (!column_exists(pdb->db, "conversations", "uuid")) {
         if (exec_sql(pdb->db, "ALTER TABLE conversations ADD COLUMN uuid TEXT;") != 0) return -1;
         exec_sql(pdb->db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_uuid ON conversations(uuid);");
     }
 
-    // Relay-side storage for mailbox + descriptors (used for intro/hsdir style rendezvous)
     const char *sql2 =
         "CREATE TABLE IF NOT EXISTS mailbox_items("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -121,7 +118,6 @@ int pcomm_db_init_schema(pcomm_db_t *pdb) {
 
     if (exec_sql(pdb->db, sql2) != 0) return -1;
 
-    // Settings + DHT node persistence (v5)
     const char *sql3 =
         "CREATE TABLE IF NOT EXISTS settings("
         " key TEXT PRIMARY KEY,"
@@ -207,7 +203,6 @@ static int64_t now_unix(sqlite3 *db) {
 }
 
 static uint64_t to_be64(uint64_t x) {
-    // portable host->big endian
     uint8_t b[8];
     b[0] = (uint8_t)((x >> 56) & 0xFF);
     b[1] = (uint8_t)((x >> 48) & 0xFF);
@@ -225,7 +220,6 @@ static uint64_t to_be64(uint64_t x) {
 int64_t pcomm_db_get_or_create_direct_conv(pcomm_db_t *pdb, const char *peer_user_id) {
     if (!pdb || !pdb->db) return -1;
 
-    // Find existing direct conversation containing peer
     const char *find_sql =
         "SELECT c.id FROM conversations c "
         "JOIN participants p ON p.conversation_id=c.id "
@@ -242,7 +236,6 @@ int64_t pcomm_db_get_or_create_direct_conv(pcomm_db_t *pdb, const char *peer_use
     }
     sqlite3_finalize(st);
 
-    // create new conversation and participant
     exec_sql(pdb->db, "BEGIN;");
 
     sqlite3_stmt *ins = NULL;
@@ -422,8 +415,6 @@ int pcomm_db_mailbox_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
 
-// Returns a packed MB_RESP body (without the leading cmd byte):
-// count(u16) [ id(u64) ts(u32) len(u32) blob ... ]*
 int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], uint8_t **out, uint32_t *out_len) {
     if (!pdb || !pdb->db || !key || !out || !out_len) return -1;
     *out = NULL; *out_len = 0;
@@ -438,7 +429,6 @@ int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], uint
     }
     sqlite3_bind_blob(st, 1, key, 32, SQLITE_TRANSIENT);
 
-    // First pass: count and size
     int count = 0;
     uint64_t ids[100];
     int64_t tss[100];
@@ -454,7 +444,6 @@ int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], uint
     }
     sqlite3_finalize(st);
 
-    // Compute output size
     uint32_t total = 2;
     for (int i = 0; i < count; i++) {
         total += 8 + 4 + 4 + (uint32_t)blens[i];
@@ -465,7 +454,6 @@ int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], uint
         exec_sql(pdb->db, "ROLLBACK;");
         return -1;
     }
-    // pack
     uint16_t ncount = (uint16_t)count;
     uint16_t n = htons(ncount);
     memcpy(buf, &n, 2);
@@ -480,9 +468,7 @@ int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], uint
         memcpy(buf + off, blobs[i], (size_t)blens[i]); off += (uint32_t)blens[i];
     }
 
-    // delete returned items
     if (count > 0) {
-        // Build a simple delete with range (id <= max_id) + key, since we always return oldest.
         uint64_t max_id = ids[count-1];
         sqlite3_stmt *del = NULL;
         if (sqlite3_prepare_v2(pdb->db, "DELETE FROM mailbox_items WHERE mkey=? AND id<=?;", -1, &del, NULL) == SQLITE_OK) {
@@ -539,8 +525,6 @@ int pcomm_db_desc_get(pcomm_db_t *pdb, const uint8_t key[32], uint8_t **blob_out
     return 0;
 }
 
-// ---- settings KV ----
-
 int pcomm_db_kv_set(pcomm_db_t *pdb, const char *key, const char *value) {
     if (!pdb || !pdb->db || !key || !value) return -1;
     const char *sql =
@@ -569,8 +553,6 @@ int pcomm_db_kv_get(pcomm_db_t *pdb, const char *key, char *value_out, size_t va
     sqlite3_finalize(st);
     return 0;
 }
-
-// ---- DHT node persistence ----
 
 int pcomm_db_dhtnode_upsert(pcomm_db_t *pdb,
                             const uint8_t node_id[20],

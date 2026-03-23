@@ -16,27 +16,24 @@
 #include <sys/socket.h>
 #include <errno.h>
 
-// NOTE: This is a deliberately small BEP-5 inspired DHT implementation.
-// It is good enough for: bootstrapping, get_peers(), announce_peer(), and
-// maintaining a modest routing table for PComm descriptor/mailbox discovery.
 
 #define DHT_MAX_NODES        1024
 #define DHT_QUERY_FANOUT     24
 #define DHT_MAX_QUERIES      96
 
-#define DHT_NODE_STALE_SEC   (60 * 60)   // 1 hour
+#define DHT_NODE_STALE_SEC   (60 * 60)
 #define DHT_NODE_PRUNE_SEC   (2 * 60 * 60)
 
 typedef struct {
     uint8_t id[20];
     struct sockaddr_in addr;
     time_t last_seen;
-    uint8_t ok; // seen a response
+    uint8_t ok;
 } dht_node_t;
 
 typedef struct peer_item {
     uint8_t infohash[20];
-    uint8_t *peers; // compact peers concatenated (6*n)
+    uint8_t *peers;
     size_t peers_len;
     struct peer_item *next;
 } peer_item_t;
@@ -112,7 +109,7 @@ static void token_for_ip(const uint8_t secret[20], const struct sockaddr_in *add
     size_t n = 0;
     memcpy(buf + n, secret, 20); n += 20;
     memcpy(buf + n, &addr->sin_addr, 4); n += 4;
-    uint32_t bucket = (uint32_t)(time(NULL) / 300); // 5 minutes
+    uint32_t bucket = (uint32_t)(time(NULL) / 300);
     bucket = htonl(bucket);
     memcpy(buf + n, &bucket, 4); n += 4;
     uint8_t h[20];
@@ -146,7 +143,6 @@ static void add_node_locked(dht_state_t *st, const uint8_t id[20], const struct 
     }
 
     if (st->nodes_len >= DHT_MAX_NODES) {
-        // Replace the stalest node.
         size_t worst = 0;
         time_t best_t = st->nodes[0].last_seen;
         for (size_t i = 1; i < st->nodes_len; i++) {
@@ -184,7 +180,6 @@ static void peers_add_locked(dht_state_t *st, const uint8_t infohash[20], const 
         st->peers_head = it;
     }
 
-    // dedupe
     for (size_t i = 0; i + 6 <= it->peers_len; i += 6) {
         if (memcmp(it->peers + i, compact6, 6) == 0) return;
     }
@@ -467,7 +462,7 @@ static void *dht_rx_thread(void *arg) {
             handle_query(st, &from, msg);
             benc_free(msg);
         } else if (y->s[0] == 'r') {
-            handle_response(st, msg); // takes ownership
+            handle_response(st, msg);
         } else {
             benc_free(msg);
         }
@@ -540,7 +535,6 @@ static int krpc_query_one(dht_state_t *st, const struct sockaddr_in *to, benc_t 
         return -1;
     }
 
-    // wait up to 1000ms
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_nsec += 1000 * 1000 * 1000L;
@@ -573,7 +567,6 @@ static void dht_prune_locked(dht_state_t *st) {
 }
 
 static void dht_flush_nodes_to_db(dht_state_t *st) {
-    // best-effort: store some recent nodes
     pthread_mutex_lock(&st->mu);
     size_t take = st->nodes_len < 256 ? st->nodes_len : 256;
     dht_node_t snap[256];
@@ -589,7 +582,6 @@ static void dht_flush_nodes_to_db(dht_state_t *st) {
 }
 
 static void dht_refresh_once(dht_state_t *st) {
-    // pick a few random nodes, ping and ask find_node.
     struct sockaddr_in work[16];
     size_t wlen = 0;
 
@@ -599,14 +591,12 @@ static void dht_refresh_once(dht_state_t *st) {
         return;
     }
 
-    // sample up to 16 nodes
     size_t take = st->nodes_len < 16 ? st->nodes_len : 16;
     for (size_t i = 0; i < take; i++) {
         size_t idx = (size_t)(rand() % (int)st->nodes_len);
         work[wlen++] = st->nodes[idx].addr;
     }
 
-    // prune stale
     dht_prune_locked(st);
     pthread_mutex_unlock(&st->mu);
 
@@ -619,7 +609,6 @@ static void dht_refresh_once(dht_state_t *st) {
         if (!q) continue;
         benc_t *resp = NULL;
         if (krpc_query_one(st, &work[i], q, &resp) == 0 && resp) {
-            // update last_seen and learn nodes if present
             benc_t *r = benc_dict_get(resp, "r");
             if (r && r->t == BENC_DICT) {
                 benc_t *nds = benc_dict_get(r, "nodes");
@@ -631,7 +620,6 @@ static void dht_refresh_once(dht_state_t *st) {
         }
         benc_free(q);
 
-        // find_node
         uint16_t tx2 = rand_tx();
         benc_t *a2 = benc_new_dict();
         benc_dict_set(a2, "target", benc_new_str(target, 20));
@@ -668,7 +656,6 @@ int pcomm_dht_get_peers_hosts(const uint8_t infohash20[20],
     if (!g_dht || !hosts || !ports || !out_len || !infohash20) return -1;
     *out_len = 0;
 
-    // Seed worklist from known nodes
     struct sockaddr_in work[128];
     size_t wlen = 0;
 
@@ -808,7 +795,6 @@ int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm
         return -1;
     }
 
-    // Bootstrap routing table
     load_bootstrap_from_contacts(st);
     load_bootstrap_from_db_nodes(st);
 
@@ -820,7 +806,6 @@ int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm
     pthread_detach(st->rx_th);
 
     if (pthread_create(&st->maint_th, NULL, dht_maint_thread, st) != 0) {
-        // keep running without maint
         fprintf(stderr, "[dht] maint thread failed\n");
     } else {
         pthread_detach(st->maint_th);

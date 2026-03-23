@@ -51,7 +51,6 @@ int benc_list_add(benc_t *l, benc_t *item) {
 int benc_dict_set(benc_t *d, const char *key, benc_t *val) {
     if (!d || d->t != BENC_DICT || !key || !val) return -1;
     size_t klen = strlen(key);
-    // replace if exists
     for (size_t i=0;i<d->dict_len;i++) {
         if (d->dict[i].klen == klen && memcmp(d->dict[i].k, key, klen) == 0) {
             benc_free(d->dict[i].v);
@@ -99,7 +98,6 @@ benc_t *benc_dict_get(benc_t *d, const char *key) {
 }
 
 static int parse_int(const uint8_t *buf, size_t len, size_t *pos, benc_t **out) {
-    // i<digits>e
     if (*pos >= len || buf[*pos] != 'i') return -1;
     (*pos)++;
     if (*pos >= len) return -1;
@@ -119,7 +117,6 @@ static int parse_int(const uint8_t *buf, size_t len, size_t *pos, benc_t **out) 
 }
 
 static int parse_str(const uint8_t *buf, size_t len, size_t *pos, benc_t **out) {
-    // <len>:<bytes>
     if (*pos >= len || !isdigit(buf[*pos])) return -1;
     size_t n = 0;
     while (*pos < len && isdigit(buf[*pos])) {
@@ -138,7 +135,6 @@ static int parse_str(const uint8_t *buf, size_t len, size_t *pos, benc_t **out) 
 
 static int parse_list(const uint8_t *buf, size_t len, size_t *pos, benc_t **out);
 static int parse_dict(const uint8_t *buf, size_t len, size_t *pos, benc_t **out);
-
 static int parse_any(const uint8_t *buf, size_t len, size_t *pos, benc_t **out) {
     if (*pos >= len) return -1;
     uint8_t c = buf[*pos];
@@ -175,7 +171,6 @@ static int parse_dict(const uint8_t *buf, size_t len, size_t *pos, benc_t **out)
         if (parse_str(buf, len, pos, &k) != 0) { benc_free(d); return -1; }
         benc_t *v = NULL;
         if (parse_any(buf, len, pos, &v) != 0) { benc_free(k); benc_free(d); return -1; }
-        // key bytes are not NUL-terminated; copy into C string
         char *ks = (char*)malloc(k->slen + 1);
         if (!ks) { benc_free(k); benc_free(v); benc_free(d); return -1; }
         memcpy(ks, k->s, k->slen);
@@ -200,8 +195,6 @@ int benc_parse(const uint8_t *buf, size_t len, benc_t **out, size_t *used) {
     *out = n;
     return 0;
 }
-
-// --- encoding ---
 
 typedef struct {
     uint8_t *b;
@@ -264,7 +257,6 @@ static int kv_cmp(const void *a, const void *b) {
 
 static int enc_dict(wbuf_t *w, const benc_t *n) {
     if (wb_put(w, "d", 1) != 0) return -1;
-    // spec requires lexicographic order; sort a copy
     benc_kv_t *tmp = NULL;
     if (n->dict_len) {
         tmp = (benc_kv_t*)malloc(n->dict_len * sizeof(benc_kv_t));

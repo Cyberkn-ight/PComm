@@ -26,7 +26,6 @@ static uint16_t get_u16(const uint8_t *p){ uint16_t n; memcpy(&n,p,2); return nt
 static uint32_t get_u32(const uint8_t *p){ uint32_t n; memcpy(&n,p,4); return ntohl(n); }
 
 static uint32_t epoch_now(void) {
-    // 6-hour epochs
     time_t t = time(NULL);
     return (uint32_t)(t / (6 * 3600));
 }
@@ -49,7 +48,7 @@ typedef struct rdv_sess rdv_sess_t;
 
 typedef struct {
     pcomm_peer_t intro;
-    pcomm_circuit_t *circ; // long-lived circuit to intro point
+    pcomm_circuit_t *circ;
 } intro_circ_t;
 
 struct rdv_wait {
@@ -64,7 +63,7 @@ struct rdv_wait {
 struct rdv_sess {
     char peer_id[96];
     uint8_t cookie[20];
-    pcomm_circuit_t *circ; // circuit to rendezvous point
+    pcomm_circuit_t *circ;
     time_t last_used;
     int established;
     rdv_sess_t *next;
@@ -74,15 +73,9 @@ typedef struct {
     pcomm_config_t cfg;
     pcomm_identity_t me;
     pcomm_db_t *db;
-
-    // cached intro points from last publish (also published in descriptor blob)
     pcomm_peer_t intros[3];
     size_t intro_count;
-
-    // long-lived intro circuits (one per intro point)
     intro_circ_t intro_circs[3];
-
-    // rendezvous waits/sessions
     pthread_mutex_t rdv_mu;
     rdv_wait_t *waits;
     rdv_sess_t *sessions;
@@ -146,7 +139,6 @@ static rdv_sess_t *rdv_find_session(hidden_state_t *st, const char *peer_id) {
     pthread_mutex_lock(&st->rdv_mu);
     for (rdv_sess_t *s = st->sessions; s; s = s->next) {
         if (peer_id && peer_id[0] && strcmp(s->peer_id, peer_id) == 0) {
-            // expire after 2 minutes idle
             if ((now - s->last_used) < 900) best = s;
             break;
         }
@@ -195,7 +187,6 @@ static void rdv_mark_established(hidden_state_t *st, const uint8_t cookie[20]) {
     pthread_mutex_unlock(&st->rdv_mu);
 }
 
-// Handle an incoming sealed DELIVER payload (same as mailbox items).
 static void process_sealed_message(hidden_state_t *st, const uint8_t *sealed, uint32_t sealed_len, uint32_t fallback_ts) {
     uint8_t *plain = NULL; size_t plain_len = 0;
     if (pcomm_open_seal(st->me.privkey, sealed, sealed_len, &plain, &plain_len) != 0) return;
@@ -238,7 +229,6 @@ static void process_sealed_message(hidden_state_t *st, const uint8_t *sealed, ui
     free(text);
 }
 
-// circuit event callback: handles INTRODUCE2, RENDEZVOUS2, and rendezvous DATA cells.
 static void *session_gc_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
     const int ttl = 20 * 60;
@@ -265,9 +255,6 @@ static void *session_gc_thread(void *arg) {
 static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
                                  uint8_t relay_cmd, uint16_t stream_id,
                                  const uint8_t *body, uint16_t body_len);
-
-
-// Load a random onion path (0..3 relays) excluding specific IDs.
 static int load_onion_relays(pcomm_db_t *db, const char *ex1, const char *ex2, const char *ex3, pcomm_peer_t *out, size_t out_cap, size_t *out_len) {
     *out_len = 0;
     const char *sql =
@@ -337,8 +324,6 @@ static int pick_random_relay(pcomm_db_t *db, const char *ex1, const char *ex2, c
 }
 
 
-
-// List all known relays (cap limited)
 static int list_all_relays(pcomm_db_t *db, pcomm_peer_t **out, size_t *out_len) {
     *out = NULL; *out_len = 0;
     const char *sql = "SELECT user_id, host, port, pubkey FROM contacts WHERE is_relay=1 AND host!='' AND port>0 LIMIT 500;";
@@ -430,8 +415,6 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
                            uint8_t **resp_payload, uint32_t *resp_len) {
     if (resp_payload) *resp_payload = NULL;
     if (resp_len) *resp_len = 0;
-
-    // Prefer long-lived circuit + stream multiplexing when available.
     pcomm_circuit_t *c = pcomm_circuit_get();
     if (c && dest && dest->host[0] && dest->port) {
         pcomm_msg_type_t rt = 0; uint8_t *rp = NULL; uint32_t rpl = 0;
@@ -447,16 +430,13 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
             return 0;
         }
         free(rp);
-        // fall back to single-shot onions if circuit fails
     }
 
-    // Build a random onion path (up to 3 relays), excluding self and dest.
     pcomm_peer_t path[3];
     size_t path_len = 0;
     load_onion_relays(db, me->user_id, dest->user_id, NULL, path, 3, &path_len);
 
     if (path_len == 0) {
-        // direct
         int fd = net_connect_tcp(dest->host, dest->port);
         if (fd < 0) return -1;
         int rc = pcomm_send_packet(fd, PCOMM_MSG_CTRL, NULL, ctrl_payload, ctrl_len);
@@ -477,7 +457,6 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
         return 0;
     }
 
-    // Onion deliver to dest with CTRL
     uint8_t eph_pub[32];
     uint8_t *onion = NULL; uint32_t onion_len = 0;
     if (pcomm_onion_build_v1(path, path_len, dest->host, dest->port, PCOMM_MSG_CTRL,
@@ -594,7 +573,7 @@ static int parse_descriptor_blob(const uint8_t *blob, uint32_t blob_len, pcomm_p
     uint32_t off = 0;
     uint8_t ver = blob[off++];
     if (ver != 1) return -1;
-    (void)get_u32(blob + off); off += 4; // epoch
+    (void)get_u32(blob + off); off += 4;
     uint8_t cnt = blob[off++];
     if (cnt > intros_cap) cnt = (uint8_t)intros_cap;
 
@@ -668,7 +647,6 @@ static int fetch_descriptor(pcomm_db_t *db, const pcomm_config_t *cfg, const pco
     uint8_t infohash[20];
     pcomm_dht_infohash_desc(target_id, infohash);
 
-    // Prefer DHT-discovered descriptor hosts
     char hosts[8][64]; uint16_t ports[8]; size_t hn = 0;
     if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0 && hn > 0) {
         for (size_t i = 0; i < hn; i++) {
@@ -697,7 +675,6 @@ static int fetch_descriptor(pcomm_db_t *db, const pcomm_config_t *cfg, const pco
         }
     }
 
-    // Fallback: deterministic HSDirs (v2 behavior)
     pcomm_peer_t hs[3]; size_t hs_len = 0;
     if (select_hsdirs(db, target_id, epoch, hs, &hs_len) != 0) return -1;
     for (size_t i = 0; i < hs_len; i++) {
@@ -723,8 +700,6 @@ static int fetch_descriptor(pcomm_db_t *db, const pcomm_config_t *cfg, const pco
 
 static int publish_descriptor(hidden_state_t *st) {
     uint32_t ep = epoch_now();
-
-    // choose intro points randomly from relays
     pcomm_peer_t rel[3]; size_t rel_n = 0;
     load_onion_relays(st->db, st->me.user_id, NULL, NULL, rel, 3, &rel_n);
     if (rel_n == 0) return -1;
@@ -743,7 +718,6 @@ static int publish_descriptor(hidden_state_t *st) {
     uint8_t infohash[20];
     pcomm_dht_infohash_desc(st->me.user_id, infohash);
 
-    // expires in ~12 hours
     uint32_t expires = (uint32_t)(time(NULL) + 12*3600);
 
     uint8_t *put = NULL; uint32_t put_len = 0;
@@ -752,8 +726,7 @@ static int publish_descriptor(hidden_state_t *st) {
         return -1;
     }
 
-    // Store the descriptor on a few random relays. Those relays will announce themselves in the DHT
-    // (BEP-5 announce_peer) under our descriptor infohash.
+    
     for (size_t i = 0; i < rel_n; i++) {
         onion_send_ctrl(st->db, &st->cfg, &st->me, &rel[i], put, put_len, 0, NULL, NULL);
     }
@@ -793,7 +766,6 @@ static int ensure_intro_circuits(hidden_state_t *st) {
             pcomm_circuit_set_event_cb(ic->circ, hidden_circuit_event, st);
         }
 
-        // Send ESTABLISH_INTRO each time (idempotent on intro point)
         uint8_t body[1 + 96];
         size_t sidlen = strlen(st->me.user_id);
         if (sidlen > 95) sidlen = 95;
@@ -803,7 +775,6 @@ static int ensure_intro_circuits(hidden_state_t *st) {
         pcomm_circuit_send_relay(ic->circ, PCOMM_RELAY_ESTABLISH_INTRO, 0, body, (uint16_t)(1 + sidlen));
     }
 
-    // close unused slots
     for (size_t j = n; j < 3; j++) {
         if (st->intro_circs[j].circ) {
             pcomm_circuit_close(st->intro_circs[j].circ);
@@ -817,7 +788,6 @@ static int ensure_intro_circuits(hidden_state_t *st) {
 
 static int handle_introduce2(hidden_state_t *st, const uint8_t *body, uint16_t bl) {
     if (!st || !body) return -1;
-    // body: client_id_len(1) client_id cookie(20) rp_host_len(1) rp_host rp_port(2)
     if (bl < 1 + 20 + 1 + 2) return -1;
     size_t off = 0;
     uint8_t cl = body[off++];
@@ -835,15 +805,11 @@ static int handle_introduce2(hidden_state_t *st, const uint8_t *body, uint16_t b
     memcpy(rphost, body + off, hl); rphost[hl] = '\0';
     off += hl;
     uint16_t rpport = get_u16(body + off); off += 2;
-
-    // Create a dedicated circuit to the rendezvous point and send RENDEZVOUS1(cookie)
     pcomm_circuit_t *rc = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, rphost, rpport, st->me.user_id);
     if (!rc) return -1;
     pcomm_circuit_set_event_cb(rc, hidden_circuit_event, st);
 
     rdv_add_or_update_session(st, client_id, cookie, rc);
-
-    // RENDEZVOUS1 body: cookie(20)
     pcomm_circuit_send_relay(rc, PCOMM_RELAY_RENDEZVOUS1, 0, cookie, 20);
     return 0;
 }
@@ -858,7 +824,6 @@ static int parse_mb_resp_items(hidden_state_t *st, const uint8_t *payload, uint3
 
     for (uint16_t i = 0; i < count; i++) {
         if (payload_len < off + 8 + 4 + 4) break;
-        // id (ignored)
         off += 8;
         uint32_t ts = get_u32(payload + off); off += 4;
         uint32_t bl = get_u32(payload + off); off += 4;
@@ -888,11 +853,9 @@ static int parse_mb_resp_items(hidden_state_t *st, const uint8_t *payload, uint3
             } else if (kind == PCOMM_PLAIN_GROUP_INVITE) {
                 int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, title ? title : "");
                 if (conv_id >= 0) {
-                    // add participants
                     for (int k = 0; k < member_count; k++) {
                         pcomm_db_add_participant(st->db, conv_id, members[k]);
                     }
-                    // store as a system message
                     const char *body = title ? title : "Group invite";
                     pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, body, sealed, bl, (int64_t)(mts ? mts : ts));
                 }
@@ -939,8 +902,6 @@ static void *sync_thread(void *arg) {
 
         uint8_t infohash[20];
         pcomm_dht_infohash_mb(st->me.user_id, infohash);
-
-        // Prefer DHT-discovered mailbox hosts
         char hosts[8][64]; uint16_t ports[8]; size_t hn = 0;
         if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0 && hn > 0) {
             for (size_t i = 0; i < hn; i++) {
@@ -951,7 +912,6 @@ static void *sync_thread(void *arg) {
                 poll_mailbox_from_peer(st, &p, infohash, mkey_prev);
             }
         } else {
-            // Fallback: old HSDir selection
             pcomm_peer_t hs[3]; size_t hs_len = 0;
             if (select_hsdirs(st->db, st->me.user_id, ep, hs, &hs_len) == 0) {
                 for (size_t i = 0; i < hs_len; i++) {
@@ -961,7 +921,6 @@ static void *sync_thread(void *arg) {
             }
         }
 
-        // Also poll intro points from last publish (extra redundancy)
         pthread_mutex_lock(&st->lock);
         pcomm_peer_t intros[3]; size_t intro_n = st->intro_count;
         for (size_t i = 0; i < intro_n; i++) intros[i] = st->intros[i];
@@ -996,12 +955,9 @@ static void *publish_thread(void *arg) {
 static void *cover_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
     for (;;) {
-        // random jitter 2..6 seconds
         uint8_t r[1];
         pcomm_random(r, 1);
         int delay = 2 + (r[0] % 5);
-
-        // pick a random relay as destination
         pcomm_peer_t dest;
         const char *sql = "SELECT user_id, host, port, pubkey FROM contacts WHERE is_relay=1 AND host!='' AND port>0 ORDER BY RANDOM() LIMIT 1;";
         sqlite3_stmt *stq = NULL;
@@ -1049,7 +1005,6 @@ static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
     }
 
     if (relay_cmd == PCOMM_RELAY_RENDEZVOUS2) {
-        // body: cookie(20) status(1)
         if (body_len >= 21) {
             const uint8_t *cookie = body;
             int ok = body[20] ? 1 : 0;
@@ -1059,7 +1014,6 @@ static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
         return;
     }
 
-    // Rendezvous payload: packed PComm packet carried in RELAY_DATA on an unknown stream.
     if (relay_cmd == PCOMM_RELAY_DATA && body && body_len >= PCOMM_HDR_LEN) {
         pcomm_msg_type_t mt;
         uint8_t eph[32];
@@ -1116,7 +1070,6 @@ int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const p
     uint8_t infohash[20];
     pcomm_dht_infohash_mb(recipient_id, infohash);
 
-    // Try descriptor -> intro points
     pcomm_peer_t intros[3]; size_t intro_n = 0;
     fetch_descriptor(db, cfg, me, recipient_id, ep, intros, 3, &intro_n);
 
@@ -1125,7 +1078,6 @@ int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const p
 
     int ok = -1;
 
-    // Prefer DHT-discovered mailbox hosts
     char hosts[8][64]; uint16_t ports[8]; size_t hn = 0;
     if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0 && hn > 0) {
         size_t send_n = (hn > 3) ? 3 : hn;
@@ -1138,13 +1090,11 @@ int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const p
         }
     }
 
-    // Also send to 1 intro point if available (extra redundancy)
     if (intro_n > 0) {
         onion_send_ctrl(db, cfg, me, &intros[0], put, put_len, 0, NULL, NULL);
         ok = 0;
     }
 
-    // Fallback: old deterministic HSDirs
     if (ok != 0) {
         pcomm_peer_t hs[3]; size_t hs_n = 0;
         if (select_hsdirs(db, recipient_id, ep, hs, &hs_n) == 0) {
@@ -1169,7 +1119,6 @@ static int rdv_send_over_session(hidden_state_t *st, rdv_sess_t *sess, const uin
 
     uint16_t sid = 0;
     pcomm_circuit_alloc_stream(sess->circ, &sid);
-    // send DELIVER packet in RELAY_DATA; end the stream to keep state small
     pcomm_circuit_send_relay(sess->circ, PCOMM_RELAY_DATA, sid, pkt, (uint16_t)pkt_len);
     pcomm_circuit_send_relay(sess->circ, PCOMM_RELAY_END, sid, NULL, 0);
     free(pkt);
@@ -1185,39 +1134,31 @@ static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, cons
 
     uint32_t ep = epoch_now();
 
-    // 1) fetch descriptor to get intro points
     pcomm_peer_t intros[3]; size_t intro_n = 0;
     if (fetch_descriptor(st->db, &st->cfg, &st->me, service_id, ep, intros, 3, &intro_n) != 0 || intro_n == 0) {
         return -1;
     }
 
-    // 2) pick a rendezvous point (random relay)
     pcomm_peer_t rp;
     if (pick_random_relay(st->db, st->me.user_id, intros[0].user_id, service_id, &rp) != 0) {
-        // fallback: use intro as rendezvous (not ideal, but keeps functionality)
         rp = intros[0];
     }
 
     uint8_t cookie[20];
     pcomm_random(cookie, 20);
 
-    // 3) build circuit to rendezvous point
     pcomm_circuit_t *rp_c = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, rp.host, rp.port, st->me.user_id);
     if (!rp_c) return -1;
     pcomm_circuit_set_event_cb(rp_c, hidden_circuit_event, st);
 
-    // 4) wait object for RENDEZVOUS2
     rdv_wait_t w;
     rdv_wait_init(&w, cookie);
     rdv_wait_add(st, &w);
 
-    // 5) ESTABLISH_RENDEZVOUS(cookie)
     pcomm_circuit_send_relay(rp_c, PCOMM_RELAY_ESTABLISH_RENDEZVOUS, 0, cookie, 20);
 
-    // 6) circuit to intro point, send INTRODUCE1(service_id, client_id, cookie, rp host/port)
     pcomm_circuit_t *intro_c = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, intros[0].host, intros[0].port, st->me.user_id);
     if (intro_c) {
-        // body: service_len service client_len client cookie rp_host_len rp_host rp_port
         uint8_t body[1 + 95 + 1 + 95 + 20 + 1 + 63 + 2];
         size_t off = 0;
         size_t sl = strlen(service_id); if (sl > 95) sl = 95;
@@ -1237,7 +1178,6 @@ static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, cons
         pcomm_circuit_close(intro_c);
     }
 
-    // 7) wait up to ~8 seconds
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 8;
@@ -1257,7 +1197,6 @@ static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, cons
         return -1;
     }
 
-    // 8) register session and send
     rdv_add_or_update_session(st, service_id, cookie, rp_c);
     rdv_mark_established(st, cookie);
 
@@ -1275,7 +1214,6 @@ static int rdv_try_send(hidden_state_t *st, const char *to_user_id, const uint8_
     if (sess && sess->circ && sess->established) {
         if (rdv_send_over_session(st, sess, sealed, sealed_len) == 0) return 0;
     }
-    // no session or failed: try creating one
     return rdv_connect_and_send(st, to_user_id, sealed, sealed_len);
 }
 
@@ -1283,7 +1221,6 @@ int pcomm_hidden_send_direct_text(pcomm_db_t *db, const pcomm_config_t *cfg, con
                                  const char *to_user_id, const char *text) {
     if (!db || !cfg || !me || !to_user_id || !text) return -1;
 
-    // recipient pubkey is self-certifying from the id
     uint8_t recip_pub[32];
     if (pcomm_pubkey_from_user_id(to_user_id, recip_pub) != 0) {
         fprintf(stderr, "Bad recipient id\n");
@@ -1310,7 +1247,6 @@ int pcomm_hidden_send_direct_text(pcomm_db_t *db, const pcomm_config_t *cfg, con
         send_rc = pcomm_hidden_mailbox_send(db, cfg, me, to_user_id, sealed, sealed_len);
     }
 
-    // Store outbound (direct)
     int64_t conv_id = pcomm_db_get_or_create_direct_conv(db, to_user_id);
     if (conv_id >= 0) {
         pcomm_db_insert_message(db, conv_id, 1, to_user_id, me->user_id, text, sealed, sealed_len, (int64_t)ts);

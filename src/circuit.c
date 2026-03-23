@@ -44,11 +44,8 @@ struct pcomm_circuit {
 
     pthread_mutex_t mu;
     uint16_t next_stream;
-
-    // stream waiters
     stream_wait_t *streams[STREAM_MAP_CAP];
 
-    // lifecycle
     time_t created_at;
     time_t last_io;
     uint64_t bytes_sent;
@@ -56,17 +53,13 @@ struct pcomm_circuit {
 
     int running;
 
-    // Optional callback for non-RPC relay events
     pcomm_relay_event_cb event_cb;
     void *event_cb_arg;
 
-    // config snapshot (used by maint thread)
     pcomm_config_t cfg;
 
     int is_dedicated;
 };
-
-// ---- Global circuit manager (primary + spare) ----
 
 static pthread_t g_mgr_th;
 static pthread_mutex_t g_mgr_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -76,8 +69,6 @@ static pcomm_circuit_t *g_spare = NULL;
 static pcomm_config_t g_cfg;
 static pcomm_identity_t g_me;
 static pcomm_db_t *g_db = NULL;
-
-// ---- helpers ----
 
 static void stream_wait_free(stream_wait_t *w) {
     if (!w) return;
@@ -257,7 +248,6 @@ static uint16_t alloc_stream_id_locked(pcomm_circuit_t *c) {
     return sid;
 }
 
-// ---- RX + maintenance threads ----
 
 static void *rx_loop(void *arg) {
     pcomm_circuit_t *c = (pcomm_circuit_t*)arg;
@@ -319,7 +309,6 @@ static void *rx_loop(void *arg) {
                         }
                     }
 
-                    // Keepalive PONG on stream 0: just touch.
                     if (!consumed && rcmd == PCOMM_RELAY_PONG && sid == 0) {
                         consumed = 1;
                     }
@@ -335,7 +324,6 @@ static void *rx_loop(void *arg) {
         free(p);
     }
 
-    // signal waiters
     pthread_mutex_lock(&c->mu);
     for (size_t i = 0; i < STREAM_MAP_CAP; i++) {
         stream_wait_t *w = c->streams[i];
@@ -350,7 +338,6 @@ static void *rx_loop(void *arg) {
 static void *maint_loop(void *arg) {
     pcomm_circuit_t *c = (pcomm_circuit_t*)arg;
 
-    // jitter
     uint8_t r[1];
     (void)pcomm_random(r, 1);
     usleep((useconds_t)(1000 * (200 + (r[0] % 200))));
@@ -361,14 +348,12 @@ static void *maint_loop(void *arg) {
         time_t now = time(NULL);
         time_t last = c->last_io ? c->last_io : c->created_at;
 
-        // Dedicated circuits: close after long idle.
         if (c->is_dedicated && c->cfg.dedicated_circuit_idle_sec > 0) {
             if ((uint32_t)(now - last) > c->cfg.dedicated_circuit_idle_sec) {
                 break;
             }
         }
 
-        // Send periodic end-to-end keepalive when idle.
         if (c->cfg.circuit_keepalive_idle_ms > 0) {
             if ((uint32_t)(now - last) * 1000U >= c->cfg.circuit_keepalive_idle_ms) {
                 uint8_t nonce[8];
@@ -379,19 +364,16 @@ static void *maint_loop(void *arg) {
             }
         }
 
-        // Random sleep 8..16 seconds
         (void)pcomm_random(r, 1);
         int ms = 8000 + (r[0] % 9000);
         usleep((useconds_t)(1000 * ms));
     }
 
-    // trigger close
     c->running = 0;
     shutdown(c->fd, SHUT_RDWR);
     return NULL;
 }
 
-// ---- build ----
 
 static int db_pick_random_relays(pcomm_db_t *db,
                                 const char *exclude1,
@@ -451,7 +433,6 @@ static int db_pick_guard(pcomm_db_t *db, pcomm_peer_t *guard_out) {
         }
     }
 
-    // pick a new guard
     pcomm_peer_t g;
     size_t n = 0;
     if (db_pick_random_relays(db, NULL, NULL, NULL, &g, 1, &n) != 0 || n == 0) return -1;
@@ -475,7 +456,6 @@ static int circuit_build(pcomm_circuit_t *c, const pcomm_peer_t *path, size_t pa
 
     static const uint8_t basepoint[32] = {9};
 
-    // hop1 CREATE
     uint8_t eph1_priv[32], eph1_pub[32];
     if (pcomm_random(eph1_priv, 32) != 0) return -1;
     if (pcomm_x25519_derive(eph1_priv, basepoint, eph1_pub) != 0) return -1;
@@ -499,7 +479,6 @@ static int circuit_build(pcomm_circuit_t *c, const pcomm_peer_t *path, size_t pa
     c->path[0] = path[0];
     c->nhops = 1;
 
-    // extend further hops
     for (size_t hi = 1; hi < path_len; hi++) {
         uint8_t eph_priv[32], eph_pub[32];
         if (pcomm_random(eph_priv, 32) != 0) return -1;
@@ -522,7 +501,6 @@ static int circuit_build(pcomm_circuit_t *c, const pcomm_peer_t *path, size_t pa
         }
         pthread_mutex_unlock(&c->mu);
 
-        // wait for EXTENDED
         pcomm_msg_type_t t;
         uint8_t eph[32];
         uint8_t *pp = NULL;
@@ -604,49 +582,40 @@ static void circuit_close_internal(pcomm_circuit_t *c) {
     free(c);
 }
 
-// ---- manager ----
 
 static pcomm_circuit_t *build_new_circuit(int is_dedicated,
                                          const char *exit_host,
                                          uint16_t exit_port,
                                          const char *exclude_uid) {
-    // Build a 1..3 hop circuit.
     pcomm_peer_t path[PCOMM_MAX_HOPS];
     size_t n = 0;
 
     if (!is_dedicated) {
-        // global circuits: choose a stable guard
         pcomm_peer_t guard;
         if (db_pick_guard(g_db, &guard) != 0) return NULL;
         path[n++] = guard;
-        // pick middle + exit relays
         pcomm_peer_t others[2];
         size_t on = 0;
         (void)db_pick_random_relays(g_db, guard.user_id, g_me.user_id, NULL, others, 2, &on);
         for (size_t i = 0; i < on && n < PCOMM_MAX_HOPS; i++) path[n++] = others[i];
     } else {
-        // dedicated circuits: still prefer guard if available
         pcomm_peer_t guard;
         if (db_pick_guard(g_db, &guard) == 0) {
             path[n++] = guard;
         }
-        // middle
         pcomm_peer_t mid[2]; size_t mn = 0;
         (void)db_pick_random_relays(g_db, (n ? path[0].user_id : NULL), exclude_uid, NULL, mid, (n ? 1 : 2), &mn);
         for (size_t i = 0; i < mn && n < 2; i++) path[n++] = mid[i];
 
-        // exit is fixed host/port
         pcomm_peer_t exitp;
         memset(&exitp, 0, sizeof(exitp));
         snprintf(exitp.host, sizeof(exitp.host), "%s", exit_host);
         exitp.port = exit_port;
         path[n++] = exitp;
 
-        // ensure at least 1 hop
         if (n == 0) return NULL;
     }
 
-    // If dedicated and guard not chosen, ensure at least one hop exists.
     if (!is_dedicated && n == 0) return NULL;
 
     pcomm_circuit_t *c = (pcomm_circuit_t*)calloc(1, sizeof(*c));
@@ -679,7 +648,6 @@ static void mgr_tick(void) {
     pcomm_circuit_t *s = g_spare;
     pthread_mutex_unlock(&g_mgr_mu);
 
-    // Ensure primary
     if (!p) {
         pcomm_circuit_t *nc = build_new_circuit(0, NULL, 0, NULL);
         if (nc) {
@@ -690,10 +658,8 @@ static void mgr_tick(void) {
         return;
     }
 
-    // Rotate by age
     time_t now = time(NULL);
     if (g_cfg.circuit_max_age_sec > 0 && (uint32_t)(now - p->created_at) > g_cfg.circuit_max_age_sec) {
-        // Build a new spare first.
         if (!s) {
             pcomm_circuit_t *ns = build_new_circuit(0, NULL, 0, NULL);
             if (ns) {
@@ -702,7 +668,6 @@ static void mgr_tick(void) {
                 pthread_mutex_unlock(&g_mgr_mu);
             }
         }
-        // Swap if spare ready
         pthread_mutex_lock(&g_mgr_mu);
         if (g_spare) {
             pcomm_circuit_t *old = g_primary;
@@ -715,7 +680,6 @@ static void mgr_tick(void) {
         pthread_mutex_unlock(&g_mgr_mu);
     }
 
-    // Ensure spare
     if (g_cfg.circuit_pool_size >= 2 && !s) {
         pcomm_circuit_t *ns = build_new_circuit(0, NULL, 0, NULL);
         if (ns) {
@@ -725,7 +689,6 @@ static void mgr_tick(void) {
         }
     }
 
-    // Drop dead circuits
     if (p && !p->running) {
         pthread_mutex_lock(&g_mgr_mu);
         if (g_primary == p) {
@@ -745,7 +708,6 @@ static void mgr_tick(void) {
 
 static void *mgr_loop(void *arg) {
     (void)arg;
-    // seed rand for DHT sampling, etc.
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
     for (;;) {
@@ -754,8 +716,6 @@ static void *mgr_loop(void *arg) {
     }
     return NULL;
 }
-
-// ---- API ----
 
 int pcomm_circuits_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db) {
     if (!cfg || !me || !db) return -1;
@@ -808,19 +768,15 @@ static pcomm_circuit_t *build_dedicated_circuit(const pcomm_config_t *cfg, const
     pcomm_peer_t path[PCOMM_MAX_HOPS];
     size_t n = 0;
 
-    // Prefer the same guard selection logic (stored in settings).
     pcomm_peer_t guard;
     if (db_pick_guard(db, &guard) == 0) {
         path[n++] = guard;
     }
 
-    // Optional middle hop (avoid duplicates).
     pcomm_peer_t mids[2];
     size_t mn = 0;
     (void)db_pick_random_relays(db, (n ? path[0].user_id : NULL), exclude_uid, NULL, mids, 1, &mn);
     for (size_t i = 0; i < mn && n < (PCOMM_MAX_HOPS - 1); i++) path[n++] = mids[i];
-
-    // Exit hop.
     pcomm_peer_t exitp;
     memset(&exitp, 0, sizeof(exitp));
     snprintf(exitp.host, sizeof(exitp.host), "%s", exit_host);
@@ -834,7 +790,6 @@ static pcomm_circuit_t *build_dedicated_circuit(const pcomm_config_t *cfg, const
     c->cfg = *cfg;
     c->is_dedicated = 1;
 
-    // For dedicated circuits we do not require global manager state.
     (void)me;
     if (circuit_build(c, path, n) != 0) {
         circuit_close_internal(c);
@@ -872,7 +827,6 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
     uint32_t inner_len = 0;
     if (pcomm_pack_packet(inner_type, NULL, inner_payload, inner_payload_len, &inner, &inner_len) != 0) return -1;
 
-    // Allocate stream + waiter
     pthread_mutex_lock(&c->mu);
     uint16_t sid = alloc_stream_id_locked(c);
     stream_wait_t *w = stream_wait_new(sid);
@@ -883,7 +837,6 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
         return -1;
     }
 
-    // BEGIN
     uint8_t b[1 + 64 + 2 + 1];
     size_t hl = strlen(dest_host);
     if (hl == 0 || hl > 63) {
@@ -908,9 +861,7 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
         return -1;
     }
 
-    // DATA
     if (send_relay_cmd_locked(c, PCOMM_RELAY_DATA, sid, inner, (uint16_t)inner_len) != 0) {
-        // best-effort END
         (void)send_relay_cmd_locked(c, PCOMM_RELAY_END, sid, NULL, 0);
         stream_map_del(c, sid);
         pthread_mutex_unlock(&c->mu);
@@ -919,7 +870,6 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
         return -1;
     }
 
-    // END
     (void)send_relay_cmd_locked(c, PCOMM_RELAY_END, sid, NULL, 0);
 
     pthread_mutex_unlock(&c->mu);
@@ -933,7 +883,6 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
         return 0;
     }
 
-    // Wait up to 5 seconds
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += 5;

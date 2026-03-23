@@ -107,38 +107,25 @@ bool net_addr_is_private(const void *addr, int family) {
 
     if (family == AF_INET) {
         const uint8_t *a = (const uint8_t*)addr;
-        // 0.0.0.0/8
         if (a[0] == 0) return true;
-        // 127.0.0.0/8
         if (a[0] == 127) return true;
-        // 10.0.0.0/8
         if (a[0] == 10) return true;
-        // 172.16.0.0/12
         if (a[0] == 172 && (a[1] >= 16 && a[1] <= 31)) return true;
-        // 192.168.0.0/16
         if (a[0] == 192 && a[1] == 168) return true;
-        // 169.254.0.0/16 link-local
         if (a[0] == 169 && a[1] == 254) return true;
-        // 100.64.0.0/10 CGNAT
         if (a[0] == 100 && (a[1] >= 64 && a[1] <= 127)) return true;
-        // multicast/broadcast/reserved
         if (a[0] >= 224) return true;
         return false;
     }
 
     if (family == AF_INET6) {
         const uint8_t *a = (const uint8_t*)addr;
-        // ::/128
         static const uint8_t z16[16] = {0};
         if (memcmp(a, z16, 16) == 0) return true;
-        // ::1 loopback
         static const uint8_t l16[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
         if (memcmp(a, l16, 16) == 0) return true;
-        // fc00::/7 unique local
         if ((a[0] & 0xFE) == 0xFC) return true;
-        // fe80::/10 link-local
         if (a[0] == 0xFE && (a[1] & 0xC0) == 0x80) return true;
-        // ff00::/8 multicast
         if (a[0] == 0xFF) return true;
         return false;
     }

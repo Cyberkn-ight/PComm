@@ -102,7 +102,6 @@ static int aead_crypt(int enc,
         if (EVP_EncryptFinal_ex(ctx, out + out_len, &len) != 1) goto cleanup;
         out_len += len;
 
-        // tag appended
         if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, out + out_len) != 1) goto cleanup;
         out_len += 16;
         *out_len_inout = (size_t)out_len;
@@ -226,7 +225,7 @@ int pcomm_open_seal(const uint8_t recipient_priv[32],
     const uint8_t info[] = "pcomm-seal-v1";
     if (pcomm_hkdf_sha256(shared, sizeof(shared), NULL, 0, info, sizeof(info)-1, key, sizeof(key)) != 0) return -1;
 
-    uint8_t *pt = (uint8_t*)malloc(ct_len); // upper bound
+    uint8_t *pt = (uint8_t*)malloc(ct_len);
     if (!pt) return -1;
     size_t pt_len = ct_len;
 

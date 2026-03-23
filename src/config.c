@@ -32,8 +32,6 @@ void pcomm_config_defaults(pcomm_config_t *cfg) {
     cfg->http_port = 8080;
 
     snprintf(cfg->peers_path, sizeof(cfg->peers_path), "./peers.txt");
-
-    // Hardening defaults (safe-by-default).
     cfg->allow_private_addrs = false;
     cfg->allow_private_exit = false;
 
