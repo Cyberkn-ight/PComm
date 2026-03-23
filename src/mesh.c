@@ -2,6 +2,7 @@
 #include "net.h"
 #include "proto.h"
 #include "identity.h"
+#include "crypto.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -41,7 +42,7 @@ static int pick_random_relay(pcomm_db_t *db, pcomm_peer_t *out) {
 static int build_hello(const pcomm_config_t *cfg, const pcomm_identity_t *me, uint8_t **out, uint32_t *out_len) {
     const char *adv_host = (cfg->advertise_host[0] != '\0') ? cfg->advertise_host : cfg->relay_host;
     uint16_t adv_port = (cfg->advertise_port != 0) ? cfg->advertise_port : cfg->relay_port;
-    if (strcmp(adv_host, "0.0.0.0") == 0) adv_host = "127.0.0.1"; // last-resort
+    if (strcmp(adv_host, "0.0.0.0") == 0) adv_host = "127.0.0.1";
 
     size_t uid_len = strlen(me->user_id);
     size_t host_len = strlen(adv_host);
@@ -100,7 +101,6 @@ static int parse_peers_resp(pcomm_db_t *db, const uint8_t *payload, uint32_t pay
         uint8_t pk[32];
         memcpy(pk, payload + off, 32); off += 32;
 
-        // verify uid matches pk
         char derived[96];
         if (pcomm_user_id_from_pubkey(pk, derived) != 0) continue;
         if (strcmp(uid, derived) != 0) continue;
@@ -121,10 +121,8 @@ static void *mesh_thread(void *arg) {
     mesh_state_t *st = (mesh_state_t*)arg;
 
     for (;;) {
-        // try to learn from a random relay
         pcomm_peer_t peer;
         if (pick_random_relay(st->db, &peer) == 0) {
-            // HELLO (one-shot connection)
             {
                 int fd = net_connect_tcp(peer.host, peer.port);
                 if (fd >= 0) {
@@ -137,7 +135,6 @@ static void *mesh_thread(void *arg) {
                 }
             }
 
-            // PEERS_REQ -> PEERS_RESP (one-shot connection)
             {
                 int fd = net_connect_tcp(peer.host, peer.port);
                 if (fd >= 0) {
@@ -161,7 +158,12 @@ static void *mesh_thread(void *arg) {
             }
         }
 
-        sleep(5);
+        uint8_t r[1];
+        pcomm_random(r, 1);
+        int base = (int)st->cfg.mesh_gossip_base_sec;
+        if (base < 3) base = 3;
+        int delay = base + (r[0] % base);
+        sleep(delay);
     }
     return NULL;
 }

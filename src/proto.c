@@ -12,7 +12,6 @@ int pcomm_send_packet(int fd, pcomm_msg_type_t type, const uint8_t eph_pub[32], 
     memcpy(hdr, PCOMM_MAGIC, 4);
     hdr[4] = PCOMM_VERSION;
     hdr[5] = (uint8_t)type;
-    // hdr[6..7] reserved
 
     uint32_t nlen = htonl(payload_len);
     memcpy(hdr + 8, &nlen, 4);

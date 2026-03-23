@@ -79,8 +79,6 @@ static int layer_encrypt(const uint8_t key[32], uint32_t circ_id,
                          uint8_t **out, uint16_t *out_len) {
     uint8_t nonce[12];
     if (pcomm_random(nonce, sizeof(nonce)) != 0) return -1;
-
-    // aad = "pcomm-relay" || circ_id_be
     uint8_t aad[16];
     memset(aad, 0, sizeof(aad));
     memcpy(aad, "pcomm-relay", 10);
@@ -122,7 +120,7 @@ static int layer_decrypt(const uint8_t key[32], uint32_t circ_id,
     uint32_t cid = htonl(circ_id);
     memcpy(aad + 12, &cid, 4);
 
-    uint8_t *pt = (uint8_t*)malloc(ct_len); // upper bound
+    uint8_t *pt = (uint8_t*)malloc(ct_len);
     if (!pt) return -1;
     size_t pt_len = ct_len;
     if (pcomm_aead_decrypt(key, nonce, aad, sizeof(aad), ct, ct_len, pt, &pt_len) != 0) {

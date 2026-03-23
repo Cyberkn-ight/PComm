@@ -102,7 +102,38 @@ int net_accept(int listen_fd, char *peer_ip, size_t peer_ip_cap, uint16_t *peer_
     return fd;
 }
 
-int net_connect_tcp(const char *host, uint16_t port) {
+bool net_addr_is_private(const void *addr, int family) {
+    if (!addr) return true;
+
+    if (family == AF_INET) {
+        const uint8_t *a = (const uint8_t*)addr;
+        if (a[0] == 0) return true;
+        if (a[0] == 127) return true;
+        if (a[0] == 10) return true;
+        if (a[0] == 172 && (a[1] >= 16 && a[1] <= 31)) return true;
+        if (a[0] == 192 && a[1] == 168) return true;
+        if (a[0] == 169 && a[1] == 254) return true;
+        if (a[0] == 100 && (a[1] >= 64 && a[1] <= 127)) return true;
+        if (a[0] >= 224) return true;
+        return false;
+    }
+
+    if (family == AF_INET6) {
+        const uint8_t *a = (const uint8_t*)addr;
+        static const uint8_t z16[16] = {0};
+        if (memcmp(a, z16, 16) == 0) return true;
+        static const uint8_t l16[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+        if (memcmp(a, l16, 16) == 0) return true;
+        if ((a[0] & 0xFE) == 0xFC) return true;
+        if (a[0] == 0xFE && (a[1] & 0xC0) == 0x80) return true;
+        if (a[0] == 0xFF) return true;
+        return false;
+    }
+
+    return true;
+}
+
+static int net_connect_tcp_internal(const char *host, uint16_t port, bool apply_policy, bool allow_private) {
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%u", (unsigned)port);
 
@@ -116,13 +147,34 @@ int net_connect_tcp(const char *host, uint16_t port) {
 
     int fd = -1;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (apply_policy && !allow_private) {
+            if (ai->ai_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in*)ai->ai_addr;
+                if (net_addr_is_private(&sin->sin_addr, AF_INET)) continue;
+            } else if (ai->ai_family == AF_INET6) {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6*)ai->ai_addr;
+                if (net_addr_is_private(&sin6->sin6_addr, AF_INET6)) continue;
+            }
+        }
+
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
+            break;
+        }
         close(fd);
         fd = -1;
     }
 
     freeaddrinfo(res);
     return fd;
+}
+
+int net_connect_tcp(const char *host, uint16_t port) {
+    return net_connect_tcp_internal(host, port, false, true);
+}
+
+int net_connect_tcp_policy(const char *host, uint16_t port, bool allow_private) {
+    return net_connect_tcp_internal(host, port, true, allow_private);
 }

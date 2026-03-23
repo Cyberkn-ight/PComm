@@ -61,7 +61,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Background network tasks
     pcomm_mesh_start(&cfg, &me, &db);
     pcomm_dht_start(&cfg, &me, &db);
     pcomm_circuits_start(&cfg, &me, &db);

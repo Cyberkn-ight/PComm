@@ -19,11 +19,17 @@
 #include <sqlite3.h>
 #include <sys/select.h>
 
+typedef struct intro_reg intro_reg_t;
+typedef struct rdv_reg rdv_reg_t;
 typedef struct {
     pcomm_config_t cfg;
     pcomm_identity_t id;
     pcomm_db_t *db;
     int listen_fd;
+    pthread_mutex_t hs_mu;
+    intro_reg_t *intro_regs;
+    rdv_reg_t *rdv_regs;
+    uint64_t next_conn_id;
 } relay_state_t;
 
 typedef struct {
@@ -45,10 +51,9 @@ static int ctrl_send_peers_resp(relay_state_t *st, int fd, uint16_t want) {
     if (sqlite3_prepare_v2(st->db->db, sql, -1, &q, NULL) != SQLITE_OK) return -1;
     sqlite3_bind_int(q, 1, (int)want);
 
-    // First pass: count and size
     struct item { const char *uid; const char *host; int port; const void *pk; int pklen; } items[200];
     int count = 0;
-    size_t total = 1 + 2; // cmd + count
+    size_t total = 1 + 2;
 
     while (sqlite3_step(q) == SQLITE_ROW && count < (int)want) {
         const char *uid = (const char*)sqlite3_column_text(q, 0);
@@ -117,7 +122,6 @@ static int ctrl_handle(relay_state_t *st, int fd, const uint8_t *payload, uint32
         uint8_t pk[32];
         memcpy(pk, payload + off, 32);
 
-        // verify
         char derived[96];
         if (pcomm_user_id_from_pubkey(pk, derived) != 0) return 0;
         if (strcmp(uid, derived) != 0) return 0;
@@ -133,7 +137,6 @@ static int ctrl_handle(relay_state_t *st, int fd, const uint8_t *payload, uint32
     }
 
     if (cmd == PCOMM_CTRL_DESC_PUT) {
-        // payload: cmd(1) infohash(20) dkey(32) expires(4) bloblen(4) blob
         if (payload_len < off + 20 + 32 + 4 + 4) return 0;
         uint8_t infohash[20];
         memcpy(infohash, payload + off, 20); off += 20;
@@ -144,15 +147,12 @@ static int ctrl_handle(relay_state_t *st, int fd, const uint8_t *payload, uint32
         if (payload_len < off + bl) return 0;
         int64_t now = (int64_t)time(NULL);
         pcomm_db_desc_put(st->db, dkey, payload + off, bl, (int64_t)expires, now);
-        // announce ourselves as a descriptor host
         pcomm_dht_announce(infohash, st->cfg.relay_port);
         return 0;
     }
 
     if (cmd == PCOMM_CTRL_DESC_GET) {
-        // payload: cmd(1) infohash(20) dkey(32)
         if (payload_len < off + 20 + 32) return 0;
-        // infohash unused for get
         off += 20;
         uint8_t dkey[32];
         memcpy(dkey, payload + off, 32);
@@ -178,7 +178,6 @@ static int ctrl_handle(relay_state_t *st, int fd, const uint8_t *payload, uint32
     }
 
     if (cmd == PCOMM_CTRL_MB_PUT) {
-        // payload: cmd(1) infohash(20) mkey(32) bloblen(4) blob
         if (payload_len < off + 20 + 32 + 4) return 0;
         uint8_t infohash[20];
         memcpy(infohash, payload + off, 20); off += 20;
@@ -188,13 +187,11 @@ static int ctrl_handle(relay_state_t *st, int fd, const uint8_t *payload, uint32
         if (payload_len < off + bl) return 0;
         int64_t now = (int64_t)time(NULL);
         pcomm_db_mailbox_put(st->db, mkey, payload + off, bl, now);
-        // announce ourselves as a mailbox host
         pcomm_dht_announce(infohash, st->cfg.relay_port);
         return 0;
     }
 
     if (cmd == PCOMM_CTRL_MB_GET) {
-        // payload: cmd(1) infohash(20) mkey(32)
         if (payload_len < off + 20 + 32) return 0;
         off += 20;
         uint8_t mkey[32];
@@ -202,7 +199,6 @@ static int ctrl_handle(relay_state_t *st, int fd, const uint8_t *payload, uint32
 
         uint8_t *body = NULL; uint32_t body_len = 0;
         if (pcomm_db_mailbox_get_and_delete(st->db, mkey, &body, &body_len) != 0) {
-            // empty response
             body = (uint8_t*)malloc(2);
             if (!body) return -1;
             body[0] = 0; body[1] = 0;
@@ -220,20 +216,51 @@ static int ctrl_handle(relay_state_t *st, int fd, const uint8_t *payload, uint32
         return 0;
     }
 
-    // NOOP or unknown
     return 0;
 }
 
-// ---- Long-lived circuits (CELL) ----
+typedef struct out_item {
+    uint8_t *plain;
+    uint16_t plain_len;
+    struct out_item *next;
+} out_item_t;
 
-typedef struct {
+typedef struct cell_conn cell_conn_t;
+
+struct intro_reg {
+    char service_id[96];
+    cell_conn_t *cc;
+    time_t added;
+    intro_reg_t *next;
+};
+
+struct rdv_reg {
+    uint8_t cookie[20];
+    cell_conn_t *cc;
+    time_t added;
+    rdv_reg_t *next;
+};
+
+struct cell_conn {
+    relay_state_t *st;
+    uint64_t conn_id;
+
     int up_fd;
-    int down_fd; // -1 if exit
+    int down_fd;
     int built;
     uint8_t k_fwd[32];
     uint8_t k_bwd[32];
-
-    // exit-side stream buffering (very small prototype)
+    cell_conn_t *rdv_partner;
+    uint8_t rdv_cookie[20];
+    pthread_mutex_t qmu;
+    out_item_t *qhead;
+    out_item_t *qtail;
+    uint32_t qlen;
+    time_t rl_window_start;
+    uint32_t rl_weight;
+    time_t last_activity;
+    int closed;
+    int refcnt;
     struct {
         uint16_t id;
         int used;
@@ -243,7 +270,86 @@ typedef struct {
         uint8_t *req;
         uint32_t req_len;
     } streams[32];
-} cell_conn_t;
+};
+
+static void cc_acquire(cell_conn_t *cc) {
+    __sync_add_and_fetch(&cc->refcnt, 1);
+}
+
+static void cc_release(cell_conn_t *cc) {
+    if (!cc) return;
+    int rc = __sync_sub_and_fetch(&cc->refcnt, 1);
+    if (rc == 0 && cc->closed) {
+        for (int i=0;i<32;i++) free(cc->streams[i].req);
+        pthread_mutex_lock(&cc->qmu);
+        out_item_t *it = cc->qhead;
+        while (it) {
+            out_item_t *n = it->next;
+            free(it->plain);
+            free(it);
+            it = n;
+        }
+        cc->qhead = cc->qtail = NULL;
+        pthread_mutex_unlock(&cc->qmu);
+        pthread_mutex_destroy(&cc->qmu);
+        free(cc);
+    }
+}
+
+static int cc_enqueue_up_plain(cell_conn_t *cc, const uint8_t *plain, uint16_t plain_len) {
+    if (!cc || !plain || plain_len == 0) return -1;
+    cc_acquire(cc);
+    pthread_mutex_lock(&cc->qmu);
+    if (cc->closed) {
+        pthread_mutex_unlock(&cc->qmu);
+        cc_release(cc);
+        return -1;
+    }
+
+    if (cc->st && cc->qlen >= cc->st->cfg.relay_upqueue_cap) {
+        pthread_mutex_unlock(&cc->qmu);
+        cc_release(cc);
+        return -1;
+    }
+    out_item_t *it = (out_item_t*)calloc(1, sizeof(out_item_t));
+    if (!it) {
+        pthread_mutex_unlock(&cc->qmu);
+        cc_release(cc);
+        return -1;
+    }
+    it->plain = (uint8_t*)malloc(plain_len);
+    if (!it->plain) {
+        free(it);
+        pthread_mutex_unlock(&cc->qmu);
+        cc_release(cc);
+        return -1;
+    }
+    memcpy(it->plain, plain, plain_len);
+    it->plain_len = plain_len;
+
+    if (!cc->qtail) {
+        cc->qhead = cc->qtail = it;
+    } else {
+        cc->qtail->next = it;
+        cc->qtail = it;
+    }
+    cc->qlen++;
+    pthread_mutex_unlock(&cc->qmu);
+    cc_release(cc);
+    return 0;
+}
+
+static int cc_rate_allow(cell_conn_t *cc, uint32_t weight) {
+    if (!cc) return 0;
+    time_t now = time(NULL);
+    if (cc->rl_window_start == 0 || (now - cc->rl_window_start) >= 10) {
+        cc->rl_window_start = now;
+        cc->rl_weight = 0;
+    }
+    if (cc->rl_weight + weight > 60) return 0;
+    cc->rl_weight += weight;
+    return 1;
+}
 
 static int derive_hop_keys(const uint8_t shared[32], uint8_t out_fwd[32], uint8_t out_bwd[32]) {
     const uint8_t salt[] = "pcomm-circ-v1";
@@ -297,13 +403,197 @@ static int exit_send_relay_plain(cell_conn_t *cc, uint8_t relay_cmd, uint16_t st
     return rc;
 }
 
+static void hs_unregister_by_cc(relay_state_t *st, cell_conn_t *cc) {
+    if (!st || !cc) return;
+    pthread_mutex_lock(&st->hs_mu);
+
+    intro_reg_t **pi = &st->intro_regs;
+    while (*pi) {
+        if ((*pi)->cc == cc) {
+            intro_reg_t *dead = *pi;
+            *pi = dead->next;
+            cc_release(dead->cc);
+            free(dead);
+            continue;
+        }
+        pi = &(*pi)->next;
+    }
+
+    rdv_reg_t **pr = &st->rdv_regs;
+    while (*pr) {
+        if ((*pr)->cc == cc) {
+            rdv_reg_t *dead = *pr;
+            *pr = dead->next;
+            cc_release(dead->cc);
+            free(dead);
+            continue;
+        }
+        pr = &(*pr)->next;
+    }
+
+    pthread_mutex_unlock(&st->hs_mu);
+}
+
+static void hs_prune_locked(relay_state_t *st) {
+    time_t now = time(NULL);
+
+    intro_reg_t **pi = &st->intro_regs;
+    while (*pi) {
+        if (st->cfg.hs_intro_ttl_sec && (now - (*pi)->added) > (time_t)st->cfg.hs_intro_ttl_sec) {
+            intro_reg_t *dead = *pi;
+            *pi = dead->next;
+            cc_release(dead->cc);
+            free(dead);
+            continue;
+        }
+        pi = &(*pi)->next;
+    }
+
+    rdv_reg_t **pr = &st->rdv_regs;
+    while (*pr) {
+        if (st->cfg.hs_rdv_ttl_sec && (now - (*pr)->added) > (time_t)st->cfg.hs_rdv_ttl_sec) {
+            rdv_reg_t *dead = *pr;
+            *pr = dead->next;
+            cc_release(dead->cc);
+            free(dead);
+            continue;
+        }
+        pr = &(*pr)->next;
+    }
+}
+
+static void *hs_maint_thread(void *arg) {
+    relay_state_t *st = (relay_state_t*)arg;
+    for (;;) {
+        sleep(5);
+        pthread_mutex_lock(&st->hs_mu);
+        hs_prune_locked(st);
+        pthread_mutex_unlock(&st->hs_mu);
+    }
+    return NULL;
+}
+
+static int hs_intro_register(relay_state_t *st, const char *service_id, cell_conn_t *cc) {
+    if (!st || !service_id || !cc) return -1;
+    pthread_mutex_lock(&st->hs_mu);
+
+    hs_prune_locked(st);
+    size_t count = 0;
+    intro_reg_t *it = st->intro_regs;
+    while (it) {
+        count++;
+        if (strcmp(it->service_id, service_id) == 0) {
+            cc_release(it->cc);
+            it->cc = cc; cc_acquire(cc);
+            it->added = time(NULL);
+            pthread_mutex_unlock(&st->hs_mu);
+            return 0;
+        }
+        it = it->next;
+    }
+
+    if (st->cfg.hs_max_intros && count >= st->cfg.hs_max_intros) {
+        pthread_mutex_unlock(&st->hs_mu);
+        return -1;
+    }
+    intro_reg_t *nr = (intro_reg_t*)calloc(1, sizeof(intro_reg_t));
+    if (!nr) { pthread_mutex_unlock(&st->hs_mu); return -1; }
+    snprintf(nr->service_id, sizeof(nr->service_id), "%s", service_id);
+    nr->cc = cc; cc_acquire(cc);
+    nr->added = time(NULL);
+    nr->next = st->intro_regs;
+    st->intro_regs = nr;
+
+    pthread_mutex_unlock(&st->hs_mu);
+    return 0;
+}
+
+static cell_conn_t *hs_intro_lookup(relay_state_t *st, const char *service_id) {
+    if (!st || !service_id) return NULL;
+    pthread_mutex_lock(&st->hs_mu);
+    hs_prune_locked(st);
+    intro_reg_t *it = st->intro_regs;
+    while (it) {
+        if (strcmp(it->service_id, service_id) == 0) {
+            cell_conn_t *cc = it->cc;
+            cc_acquire(cc);
+            pthread_mutex_unlock(&st->hs_mu);
+            return cc;
+        }
+        it = it->next;
+    }
+    pthread_mutex_unlock(&st->hs_mu);
+    return NULL;
+}
+
+static int hs_rdv_register(relay_state_t *st, const uint8_t cookie[20], cell_conn_t *cc) {
+    if (!st || !cookie || !cc) return -1;
+    pthread_mutex_lock(&st->hs_mu);
+    hs_prune_locked(st);
+    size_t count = 0;
+    rdv_reg_t *it = st->rdv_regs;
+    while (it) {
+        count++;
+        if (memcmp(it->cookie, cookie, 20) == 0) {
+            pthread_mutex_unlock(&st->hs_mu);
+            return -1;
+        }
+        it = it->next;
+    }
+
+    if (st->cfg.hs_max_rdv && count >= st->cfg.hs_max_rdv) {
+        pthread_mutex_unlock(&st->hs_mu);
+        return -1;
+    }
+    rdv_reg_t *nr = (rdv_reg_t*)calloc(1, sizeof(rdv_reg_t));
+    if (!nr) { pthread_mutex_unlock(&st->hs_mu); return -1; }
+    memcpy(nr->cookie, cookie, 20);
+    nr->cc = cc; cc_acquire(cc);
+    nr->added = time(NULL);
+    nr->next = st->rdv_regs;
+    st->rdv_regs = nr;
+
+    pthread_mutex_unlock(&st->hs_mu);
+    return 0;
+}
+
+static cell_conn_t *hs_rdv_take(relay_state_t *st, const uint8_t cookie[20]) {
+    if (!st || !cookie) return NULL;
+    pthread_mutex_lock(&st->hs_mu);
+    hs_prune_locked(st);
+    rdv_reg_t **pp = &st->rdv_regs;
+    while (*pp) {
+        if (memcmp((*pp)->cookie, cookie, 20) == 0) {
+            rdv_reg_t *hit = *pp;
+            *pp = hit->next;
+            cell_conn_t *cc = hit->cc;
+            free(hit);
+            pthread_mutex_unlock(&st->hs_mu);
+            return cc;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&st->hs_mu);
+    return NULL;
+}
+
+static void hs_rdv_unlink(cell_conn_t *a, cell_conn_t *b) {
+    if (!a || !b) return;
+    if (a->rdv_partner == b) {
+        a->rdv_partner = NULL;
+        cc_release(b);
+    }
+    if (b->rdv_partner == a) {
+        b->rdv_partner = NULL;
+        cc_release(a);
+    }
+}
+
 static int exit_process_stream_done(cell_conn_t *cc, uint16_t sid) {
-    // find stream
     int idx = -1;
     for (int i=0;i<32;i++) if (cc->streams[i].used && cc->streams[i].id == sid) { idx=i; break; }
     if (idx < 0) return -1;
-    // connect dest
-    int fd = net_connect_tcp(cc->streams[idx].host, cc->streams[idx].port);
+    int fd = net_connect_tcp_policy(cc->streams[idx].host, cc->streams[idx].port, cc->st ? cc->st->cfg.allow_private_exit : false);
     if (fd < 0) {
         cc->streams[idx].used = 0;
         free(cc->streams[idx].req);
@@ -311,7 +601,6 @@ static int exit_process_stream_done(cell_conn_t *cc, uint16_t sid) {
         cc->streams[idx].req_len = 0;
         return exit_send_relay_plain(cc, PCOMM_RELAY_END, sid, NULL, 0);
     }
-    // send raw request bytes
     if (net_sendall(fd, cc->streams[idx].req, cc->streams[idx].req_len) != 0) {
         close(fd);
         cc->streams[idx].used = 0;
@@ -341,12 +630,129 @@ static int exit_process_stream_done(cell_conn_t *cc, uint16_t sid) {
     return exit_send_relay_plain(cc, PCOMM_RELAY_END, sid, NULL, 0);
 }
 
-static int cell_handle_exit_plain(cell_conn_t *cc, const uint8_t *plain, uint16_t plain_len) {
+static int cell_handle_exit_plain(relay_state_t *st, cell_conn_t *cc, const uint8_t *plain, uint16_t plain_len) {
     uint8_t rcmd; uint16_t sid; const uint8_t *body; uint16_t bl;
     if (pcomm_relay_plain_unpack(plain, plain_len, &rcmd, &sid, &body, &bl) != 0) return -1;
+    if (rcmd == PCOMM_RELAY_PING) {
+        return exit_send_relay_plain(cc, PCOMM_RELAY_PONG, sid, body, bl);
+    }
+    if (rcmd == PCOMM_RELAY_PONG) {
+        return 0;
+    }
+
+    uint32_t w = 1;
+    switch (rcmd) {
+        case PCOMM_RELAY_ESTABLISH_INTRO: w = 10; break;
+        case PCOMM_RELAY_INTRODUCE1: w = 20; break;
+        case PCOMM_RELAY_ESTABLISH_RENDEZVOUS: w = 10; break;
+        case PCOMM_RELAY_RENDEZVOUS1: w = 10; break;
+        case PCOMM_RELAY_BEGIN: w = 2; break;
+        default: w = 1; break;
+    }
+    if (!cc_rate_allow(cc, w)) {
+        return 0;
+    }
+
+    if (cc->rdv_partner) {
+        if (rcmd == PCOMM_RELAY_BEGIN || rcmd == PCOMM_RELAY_CONNECTED || rcmd == PCOMM_RELAY_DATA || rcmd == PCOMM_RELAY_END) {
+            cc_enqueue_up_plain(cc->rdv_partner, plain, plain_len);
+            return 0;
+        }
+        return 0;
+    }
+
+
+    if (rcmd == PCOMM_RELAY_ESTABLISH_INTRO) {
+        if (bl < 1) return -1;
+        uint8_t sl = body[0];
+        if (sl == 0 || sl > 95 || bl < 1 + sl) return -1;
+        char sidstr[96];
+        memcpy(sidstr, body + 1, sl);
+        sidstr[sl] = '\0';
+
+        hs_intro_register(st, sidstr, cc);
+        return exit_send_relay_plain(cc, PCOMM_RELAY_INTRO_ESTABLISHED, 0, NULL, 0);
+    }
+
+    if (rcmd == PCOMM_RELAY_INTRODUCE1) {
+        if (bl < 1 + 1 + 20 + 1 + 2) return -1;
+        size_t off = 0;
+        uint8_t sl = body[off++];
+        if (sl == 0 || sl > 95 || bl < off + sl + 1) return -1;
+        char service_id[96];
+        memcpy(service_id, body + off, sl); service_id[sl] = '\0';
+        off += sl;
+
+        uint8_t cl = body[off++];
+        if (cl == 0 || cl > 95 || bl < off + cl + 20 + 1 + 2) return -1;
+        char client_id[96];
+        memcpy(client_id, body + off, cl); client_id[cl] = '\0';
+        off += cl;
+
+        const uint8_t *cookie = body + off; off += 20;
+
+        uint8_t hl = body[off++];
+        if (hl == 0 || hl > 63 || bl < off + hl + 2) return -1;
+        char rphost[64];
+        memcpy(rphost, body + off, hl); rphost[hl] = '\0';
+        off += hl;
+        uint16_t rpport = get_u16(body + off); off += 2;
+
+        cell_conn_t *svc = hs_intro_lookup(st, service_id);
+        if (!svc) {
+            return exit_send_relay_plain(cc, PCOMM_RELAY_END, 0, NULL, 0);
+        }
+        uint8_t buf[1 + 95 + 20 + 1 + 63 + 2];
+        size_t bo = 0;
+        buf[bo++] = (uint8_t)cl;
+        memcpy(buf + bo, client_id, cl); bo += cl;
+        memcpy(buf + bo, cookie, 20); bo += 20;
+        buf[bo++] = (uint8_t)hl;
+        memcpy(buf + bo, rphost, hl); bo += hl;
+        put_u16(buf + bo, rpport); bo += 2;
+
+        uint8_t *p2 = NULL; uint16_t p2l = 0;
+        if (pcomm_relay_plain_pack(PCOMM_RELAY_INTRODUCE2, 0, buf, (uint16_t)bo, &p2, &p2l) == 0) {
+            cc_enqueue_up_plain(svc, p2, p2l);
+            free(p2);
+        }
+        cc_release(svc);
+
+        return exit_send_relay_plain(cc, PCOMM_RELAY_INTRODUCE_ACK, 0, NULL, 0);
+    }
+
+    if (rcmd == PCOMM_RELAY_ESTABLISH_RENDEZVOUS) {
+        if (bl != 20) return -1;
+        hs_rdv_register(st, body, cc);
+        return 0;
+    }
+
+    if (rcmd == PCOMM_RELAY_RENDEZVOUS1) {
+        if (bl != 20) return -1;
+        const uint8_t *cookie = body;
+
+        cell_conn_t *client = hs_rdv_take(st, cookie);
+        if (!client) {
+            return exit_send_relay_plain(cc, PCOMM_RELAY_END, 0, NULL, 0);
+        }
+
+        cc->rdv_partner = client; cc_acquire(client);
+        client->rdv_partner = cc; cc_acquire(cc);
+        memcpy(cc->rdv_cookie, cookie, 20);
+        memcpy(client->rdv_cookie, cookie, 20);
+
+        uint8_t msg[21];
+        memcpy(msg, cookie, 20);
+        msg[20] = 1;
+        exit_send_relay_plain(client, PCOMM_RELAY_RENDEZVOUS2, 0, msg, sizeof(msg));
+        exit_send_relay_plain(cc, PCOMM_RELAY_RENDEZVOUS2, 0, msg, sizeof(msg));
+
+        cc_release(client);
+        return 0;
+    }
+
 
     if (rcmd == PCOMM_RELAY_EXTEND) {
-        // body: hostlen host port eph_pub
         if (bl < 1 + 2 + 32) return -1;
         size_t off = 0;
         uint8_t hl = body[off++];
@@ -359,10 +765,8 @@ static int cell_handle_exit_plain(cell_conn_t *cc, const uint8_t *plain, uint16_
 
         int nfd = net_connect_tcp(host, port);
         if (nfd < 0) {
-            // send failure as END
             return exit_send_relay_plain(cc, PCOMM_RELAY_END, 0, NULL, 0);
         }
-        // send CREATE to next hop using forwarded client eph pub
         if (send_cell_link(nfd, PCOMM_CELL_CREATE, client_eph_pub, 32) != 0) { close(nfd); return -1; }
         uint8_t ccmd; uint8_t *cpl=NULL; uint16_t cpll=0;
         if (recv_cell_link(nfd, &ccmd, &cpl, &cpll) != 0 || ccmd != PCOMM_CELL_CREATED || cpll != 32) {
@@ -370,17 +774,13 @@ static int cell_handle_exit_plain(cell_conn_t *cc, const uint8_t *plain, uint16_
             close(nfd);
             return -1;
         }
-        // reply EXTENDED with relay eph pub
         int rc = exit_send_relay_plain(cc, PCOMM_RELAY_EXTENDED, 0, cpl, 32);
         free(cpl);
-
-        // become middle hop
         cc->down_fd = nfd;
         return rc;
     }
 
     if (rcmd == PCOMM_RELAY_BEGIN) {
-        // body: hostlen host port expect
         if (bl < 1 + 2 + 1) return -1;
         size_t off = 0;
         uint8_t hl = body[off++];
@@ -407,7 +807,6 @@ static int cell_handle_exit_plain(cell_conn_t *cc, const uint8_t *plain, uint16_
     }
 
     if (rcmd == PCOMM_RELAY_DATA) {
-        // append request bytes
         for (int i=0;i<32;i++) {
             if (cc->streams[i].used && cc->streams[i].id == sid) {
                 uint8_t *nb = (uint8_t*)realloc(cc->streams[i].req, cc->streams[i].req_len + bl);
@@ -428,15 +827,43 @@ static int cell_handle_exit_plain(cell_conn_t *cc, const uint8_t *plain, uint16_
     return 0;
 }
 
-static int cell_loop(relay_state_t *st, int fd, const uint8_t *first_cell, uint32_t first_cell_len) {
-    cell_conn_t cc;
-    memset(&cc, 0, sizeof(cc));
-    cc.up_fd = fd;
-    cc.down_fd = -1;
+static int drain_up_queue(cell_conn_t *cc) {
+    for (;;) {
+        out_item_t *it = NULL;
+        pthread_mutex_lock(&cc->qmu);
+        if (cc->qhead) {
+            it = cc->qhead;
+            cc->qhead = it->next;
+            if (!cc->qhead) cc->qtail = NULL;
+            if (cc->qlen) cc->qlen--;
+        }
+        pthread_mutex_unlock(&cc->qmu);
+        if (!it) break;
 
-    // handle first message as if received
+        uint8_t *wrapped = NULL; uint16_t wrapped_len = 0;
+        if (!cc->closed && pcomm_relay_wrap_one_backward(cc->k_bwd, 1, it->plain, it->plain_len, &wrapped, &wrapped_len) == 0) {
+            send_cell_link(cc->up_fd, PCOMM_CELL_RELAY, wrapped, wrapped_len);
+            free(wrapped);
+        }
+        free(it->plain);
+        free(it);
+    }
+    return 0;
+}
+
+static int cell_loop(relay_state_t *st, int fd, const uint8_t *first_cell, uint32_t first_cell_len) {
+    cell_conn_t *cc = (cell_conn_t*)calloc(1, sizeof(cell_conn_t));
+    if (!cc) return -1;
+    cc->st = st;
+    cc->conn_id = __sync_add_and_fetch(&st->next_conn_id, 1);
+    cc->up_fd = fd;
+    cc->down_fd = -1;
+    cc->last_activity = time(NULL);
+    cc->rl_window_start = cc->last_activity;
+    cc->refcnt = 1;
+    pthread_mutex_init(&cc->qmu, NULL);
     uint8_t *buf = (uint8_t*)malloc(first_cell_len);
-    if (!buf) return -1;
+    if (!buf) { cc->closed = 1; cc_release(cc); return -1; }
     memcpy(buf, first_cell, first_cell_len);
 
     uint8_t *pending_payload = buf;
@@ -445,42 +872,42 @@ static int cell_loop(relay_state_t *st, int fd, const uint8_t *first_cell, uint3
     static const uint8_t basepoint[32] = {9};
 
     while (1) {
+        if (cc->built) drain_up_queue(cc);
+
         uint8_t cmd=0, flags=0; uint32_t cid=0; const uint8_t *cpl=NULL; uint16_t cpll=0;
         if (pcomm_cell_unpack(pending_payload, pending_len, &cid, &cmd, &flags, &cpl, &cpll) != 0 || cid != 1) {
             free(pending_payload);
-            return -1;
+            break;
         }
         (void)flags;
+        cc->last_activity = time(NULL);
 
         if (cmd == PCOMM_CELL_CREATE) {
-            if (cc.built || cpll != 32) { free(pending_payload); return -1; }
+            if (cc->built || cpll != 32) { free(pending_payload); break; }
             const uint8_t *client_eph_pub = cpl;
             uint8_t eph_priv[32], eph_pub[32];
             pcomm_random(eph_priv, 32);
-            if (pcomm_x25519_derive(eph_priv, basepoint, eph_pub) != 0) { free(pending_payload); return -1; }
+            if (pcomm_x25519_derive(eph_priv, basepoint, eph_pub) != 0) { free(pending_payload); break; }
             uint8_t shared[32];
-            if (pcomm_x25519_derive(eph_priv, client_eph_pub, shared) != 0) { free(pending_payload); return -1; }
-            if (derive_hop_keys(shared, cc.k_fwd, cc.k_bwd) != 0) { free(pending_payload); return -1; }
-            cc.built = 1;
-            send_cell_link(cc.up_fd, PCOMM_CELL_CREATED, eph_pub, 32);
+            if (pcomm_x25519_derive(eph_priv, client_eph_pub, shared) != 0) { free(pending_payload); break; }
+            if (derive_hop_keys(shared, cc->k_fwd, cc->k_bwd) != 0) { free(pending_payload); break; }
+            cc->built = 1;
+            send_cell_link(cc->up_fd, PCOMM_CELL_CREATED, eph_pub, 32);
         } else if (cmd == PCOMM_CELL_RELAY) {
-            if (!cc.built) { free(pending_payload); return -1; }
-            if (cc.down_fd >= 0) {
-                // middle hop: decrypt one layer forward and forward
+            if (!cc->built) { free(pending_payload); break; }
+            if (cc->down_fd >= 0) {
                 uint8_t *dec=NULL; uint16_t decl=0;
-                if (pcomm_relay_unwrap_one_forward(cc.k_fwd, 1, cpl, cpll, &dec, &decl) != 0) { free(pending_payload); return -1; }
-                send_cell_link(cc.down_fd, PCOMM_CELL_RELAY, dec, decl);
+                if (pcomm_relay_unwrap_one_forward(cc->k_fwd, 1, cpl, cpll, &dec, &decl) != 0) { free(pending_payload); break; }
+                send_cell_link(cc->down_fd, PCOMM_CELL_RELAY, dec, decl);
                 free(dec);
             } else {
-                // exit hop: decrypt and parse
                 uint8_t *plain=NULL; uint16_t plain_len=0;
-                if (pcomm_relay_unwrap_one_forward(cc.k_fwd, 1, cpl, cpll, &plain, &plain_len) == 0) {
-                    cell_handle_exit_plain(&cc, plain, plain_len);
+                if (pcomm_relay_unwrap_one_forward(cc->k_fwd, 1, cpl, cpll, &plain, &plain_len) == 0) {
+                    cell_handle_exit_plain(st, cc, plain, plain_len);
                     free(plain);
                 }
             }
         } else if (cmd == PCOMM_CELL_PADDING) {
-            // ignore
         } else if (cmd == PCOMM_CELL_DESTROY) {
             free(pending_payload);
             break;
@@ -489,26 +916,33 @@ static int cell_loop(relay_state_t *st, int fd, const uint8_t *first_cell, uint3
         free(pending_payload);
         pending_payload = NULL;
         pending_len = 0;
-
-        // select for next message from upstream or downstream
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(cc.up_fd, &rfds);
-        int maxfd = cc.up_fd;
-        if (cc.down_fd >= 0) {
-            FD_SET(cc.down_fd, &rfds);
-            if (cc.down_fd > maxfd) maxfd = cc.down_fd;
+        FD_SET(cc->up_fd, &rfds);
+        int maxfd = cc->up_fd;
+        if (cc->down_fd >= 0) {
+            FD_SET(cc->down_fd, &rfds);
+            if (cc->down_fd > maxfd) maxfd = cc->down_fd;
         }
-        if (select(maxfd+1, &rfds, NULL, NULL, NULL) <= 0) continue;
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 200 * 1000;
+        int sel = select(maxfd+1, &rfds, NULL, NULL, &tv);
+        if (sel <= 0) {
+            time_t now = time(NULL);
+            if ((now - cc->last_activity) > 1800) {
+                break;
+            }
+            continue;
+        }
 
-        if (cc.down_fd >= 0 && FD_ISSET(cc.down_fd, &rfds)) {
-            // read from downstream and wrap one backward layer, send upstream
+        if (cc->down_fd >= 0 && FD_ISSET(cc->down_fd, &rfds)) {
             uint8_t dcmd; uint8_t *dpl=NULL; uint16_t dpll=0;
-            if (recv_cell_link(cc.down_fd, &dcmd, &dpl, &dpll) != 0) { free(dpl); break; }
+            if (recv_cell_link(cc->down_fd, &dcmd, &dpl, &dpll) != 0) { free(dpl); break; }
             if (dcmd == PCOMM_CELL_RELAY) {
                 uint8_t *enc=NULL; uint16_t encl=0;
-                if (pcomm_relay_wrap_one_backward(cc.k_bwd, 1, dpl, dpll, &enc, &encl) == 0) {
-                    send_cell_link(cc.up_fd, PCOMM_CELL_RELAY, enc, encl);
+                if (pcomm_relay_wrap_one_backward(cc->k_bwd, 1, dpl, dpll, &enc, &encl) == 0) {
+                    send_cell_link(cc->up_fd, PCOMM_CELL_RELAY, enc, encl);
                     free(enc);
                 }
             }
@@ -516,22 +950,32 @@ static int cell_loop(relay_state_t *st, int fd, const uint8_t *first_cell, uint3
             continue;
         }
 
-        if (FD_ISSET(cc.up_fd, &rfds)) {
-            // read next packet from upstream
+        if (FD_ISSET(cc->up_fd, &rfds)) {
             pcomm_msg_type_t t; uint8_t eph[32]; uint8_t *p=NULL; uint32_t pl=0;
-            if (pcomm_recv_packet(cc.up_fd, &t, eph, &p, &pl) != 0) { free(p); break; }
+            if (pcomm_recv_packet(cc->up_fd, &t, eph, &p, &pl) != 0) { free(p); break; }
             if (t != PCOMM_MSG_CELL) { free(p); continue; }
             pending_payload = p;
             pending_len = pl;
             continue;
         }
     }
+    cc->closed = 1;
+    if (cc->rdv_partner) {
+        cell_conn_t *other = cc->rdv_partner;
+        hs_rdv_unlink(cc, other);
+    }
 
-    if (cc.down_fd >= 0) close(cc.down_fd);
-    // free any stream buffers
-    for (int i=0;i<32;i++) free(cc.streams[i].req);
+    hs_unregister_by_cc(st, cc);
+
+    if (cc->down_fd >= 0) close(cc->down_fd);
+    drain_up_queue(cc);
+
+    for (int i=0;i<32;i++) free(cc->streams[i].req);
+
+    cc_release(cc);
     return 0;
 }
+
 
 static void *handle_conn(void *arg) {
     conn_arg_t *ca = (conn_arg_t*)arg;
@@ -551,7 +995,6 @@ static void *handle_conn(void *arg) {
     }
 
     if (type == PCOMM_MSG_CELL) {
-        // Long-lived circuit connection.
         cell_loop(st, fd, payload, payload_len);
         free(payload);
         close(fd);
@@ -585,7 +1028,6 @@ static void *handle_conn(void *arg) {
             if (outfd >= 0) {
                 if (pcomm_send_packet(outfd, PCOMM_MSG_ONION, eph_pub, next_payload, next_payload_len) == 0) {
                     if (inst == PCOMM_INST_FORWARD_RR) {
-                        // read exactly one response packet and send it back
                         pcomm_msg_type_t rtype;
                         uint8_t reph[32];
                         uint8_t *rp = NULL; uint32_t rpl = 0;
@@ -617,7 +1059,6 @@ static void *handle_conn(void *arg) {
             free(deliver_payload);
         }
     } else if (type == PCOMM_MSG_DELIVER) {
-        // payload = sealed box to us
         uint8_t *plain = NULL;
         size_t plain_len = 0;
         if (pcomm_open_seal(st->id.privkey, payload, payload_len, &plain, &plain_len) == 0) {
@@ -695,6 +1136,13 @@ int pcomm_relay_start(const pcomm_config_t *cfg, const pcomm_identity_t *id, pco
     st->cfg = *cfg;
     st->id = *id;
     st->db = db;
+
+    pthread_mutex_init(&st->hs_mu, NULL);
+    st->intro_regs = NULL;
+    st->rdv_regs = NULL;
+    st->next_conn_id = 1000;
+    pthread_t hst;
+    if (pthread_create(&hst, NULL, hs_maint_thread, st) == 0) pthread_detach(hst);
 
     st->listen_fd = net_listen_tcp(cfg->relay_host, cfg->relay_port, 64);
     if (st->listen_fd < 0) {

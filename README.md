@@ -12,10 +12,18 @@ PComm is a **prototype** as of rn, an onion-relay messenger written in pure C (t
   - recipients poll mailboxes via onion-routed requests
 - A simple mesh gossip mechanism (HELLO + peer exchange) so new nodes can quickly learn relays
 - Lightweight cover traffic (NOOP onions) to make traffic less bursty
+- Circuit pool (primary + spare) and guard pinning (stored in DB settings)
+- End-to-end keepalive using `RELAY_PING/RELAY_PONG` (plus idle timeouts for dedicated circuits)
+- Hidden-service registry caps + TTL pruning on relays (intro + rendezvous cookies)
+- Relay upstream queue cap (prevents unbounded memory growth)
+- Exit policy safety default: relays reject connecting to private/loopback/link-local destinations unless enabled
+- DHT node persistence + maintenance (learned nodes are stored in SQLite and periodically refreshed)
+- Jittered mesh gossip interval (reduces fingerprintable periodicity)
 
 It is inspired from my good friend [S3](https://github.com/S3NP41-v) [Pcomm project](https://github.com/S3NP41-v/PComm)
 
 >  This is not production-or-daily-use-ready software. It lacks many protections Tor uses (padding schedules, guard policy, congestion control, DoS hardening, directory/dht discovery, rendezvous/intro points, etc and even some more.). Use at your own risk for learning/testing only. It will change in the following weeks.
+
 ## Build
 
 Requirements:
@@ -45,7 +53,12 @@ Binary: `build/pcomm`
 
 - On first start PComm generates `identity.key` in the data dir.
 - It prints your PComm ID.
-- Open dogshit UI: `http://127.0.0.1:8080/`
+- Open UI: `http://127.0.0.1:8080/`
+
+### Dev / local network helpers
+
+- `--allow-private-addrs` : allow learning/using private/loopback peer addresses (useful for LAN testing)
+- `--allow-private-exit`  : allow exit connections to private/loopback destinations (**unsafe**, SSRF risk)
 
 ### Notes about `--advertise`
 
@@ -72,16 +85,18 @@ PComm will:
 
 ## Messaging by ID (no recipient IP needed)
 
-You can send to a user just by their ID (yipeee):
+You can send to a user just by their ID:
 - add them to contacts (host/port optional), or just paste their ID into the send box
 - the sender encrypts E2E to the recipient public key (derived from the ID)
-- the encrypted blob is delivered to the recipient mailbox stored on relays discovered via the BEP-5 DHT (with HSDir-style fallback)
+- messages are delivered using a Tor-inspired approach:
+  - users publish a descriptor (intro points) and mailbox location hints
+  - when both are online, PComm attempts rendezvous (intro + rendezvous cookie)
+  - otherwise it falls back to mailbox dead-drops stored on relays discovered via the DHT
 
-The recipient periodically polls those mailboxes and stores messages locally.
+The recipient periodically polls mailboxes and stores messages locally.
 
 ## Group chats (prototype)
 
 - Create a group from the UI by providing a title and member IDs
 - PComm sends a group invite message to each member
-- Group messages are fanned out: the sender encrypts separately to each member (no sender-key optimization yet or in the forseeable future)
-
+- Group messages are fanned out: the sender encrypts separately to each member
