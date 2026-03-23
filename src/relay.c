@@ -275,8 +275,14 @@ struct cell_conn {
     pthread_mutex_t qmu;
     out_item_t *qhead;
     out_item_t *qtail;
+    uint32_t qlen;
+
+    // basic per-connection rate limiting (protects relays from abuse)
+    time_t rl_window_start;
+    uint32_t rl_weight;
 
     // lifecycle
+    time_t last_activity;
     int closed;
     int refcnt;
 
@@ -326,6 +332,13 @@ static int cc_enqueue_up_plain(cell_conn_t *cc, const uint8_t *plain, uint16_t p
         cc_release(cc);
         return -1;
     }
+
+    // Cap the cross-thread queue to avoid unbounded memory growth.
+    if (cc->st && cc->qlen >= cc->st->cfg.relay_upqueue_cap) {
+        pthread_mutex_unlock(&cc->qmu);
+        cc_release(cc);
+        return -1;
+    }
     out_item_t *it = (out_item_t*)calloc(1, sizeof(out_item_t));
     if (!it) {
         pthread_mutex_unlock(&cc->qmu);
@@ -348,9 +361,24 @@ static int cc_enqueue_up_plain(cell_conn_t *cc, const uint8_t *plain, uint16_t p
         cc->qtail->next = it;
         cc->qtail = it;
     }
+    cc->qlen++;
     pthread_mutex_unlock(&cc->qmu);
     cc_release(cc);
     return 0;
+}
+
+static int cc_rate_allow(cell_conn_t *cc, uint32_t weight) {
+    // Simple fixed-window limiter: 10s windows, 60 weight per window.
+    // Weights are assigned by command type in cell_handle_exit_plain().
+    if (!cc) return 0;
+    time_t now = time(NULL);
+    if (cc->rl_window_start == 0 || (now - cc->rl_window_start) >= 10) {
+        cc->rl_window_start = now;
+        cc->rl_weight = 0;
+    }
+    if (cc->rl_weight + weight > 60) return 0;
+    cc->rl_weight += weight;
+    return 1;
 }
 
 static int derive_hop_keys(const uint8_t shared[32], uint8_t out_fwd[32], uint8_t out_bwd[32]) {
@@ -438,13 +466,58 @@ static void hs_unregister_by_cc(relay_state_t *st, cell_conn_t *cc) {
     pthread_mutex_unlock(&st->hs_mu);
 }
 
+static void hs_prune_locked(relay_state_t *st) {
+    time_t now = time(NULL);
+
+    // intro regs
+    intro_reg_t **pi = &st->intro_regs;
+    while (*pi) {
+        if (st->cfg.hs_intro_ttl_sec && (now - (*pi)->added) > (time_t)st->cfg.hs_intro_ttl_sec) {
+            intro_reg_t *dead = *pi;
+            *pi = dead->next;
+            cc_release(dead->cc);
+            free(dead);
+            continue;
+        }
+        pi = &(*pi)->next;
+    }
+
+    // rendezvous regs
+    rdv_reg_t **pr = &st->rdv_regs;
+    while (*pr) {
+        if (st->cfg.hs_rdv_ttl_sec && (now - (*pr)->added) > (time_t)st->cfg.hs_rdv_ttl_sec) {
+            rdv_reg_t *dead = *pr;
+            *pr = dead->next;
+            cc_release(dead->cc);
+            free(dead);
+            continue;
+        }
+        pr = &(*pr)->next;
+    }
+}
+
+static void *hs_maint_thread(void *arg) {
+    relay_state_t *st = (relay_state_t*)arg;
+    for (;;) {
+        sleep(5);
+        pthread_mutex_lock(&st->hs_mu);
+        hs_prune_locked(st);
+        pthread_mutex_unlock(&st->hs_mu);
+    }
+    return NULL;
+}
+
 static int hs_intro_register(relay_state_t *st, const char *service_id, cell_conn_t *cc) {
     if (!st || !service_id || !cc) return -1;
     pthread_mutex_lock(&st->hs_mu);
 
+    hs_prune_locked(st);
+    size_t count = 0;
+
     // replace existing
     intro_reg_t *it = st->intro_regs;
     while (it) {
+        count++;
         if (strcmp(it->service_id, service_id) == 0) {
             cc_release(it->cc);
             it->cc = cc; cc_acquire(cc);
@@ -455,6 +528,10 @@ static int hs_intro_register(relay_state_t *st, const char *service_id, cell_con
         it = it->next;
     }
 
+    if (st->cfg.hs_max_intros && count >= st->cfg.hs_max_intros) {
+        pthread_mutex_unlock(&st->hs_mu);
+        return -1;
+    }
     intro_reg_t *nr = (intro_reg_t*)calloc(1, sizeof(intro_reg_t));
     if (!nr) { pthread_mutex_unlock(&st->hs_mu); return -1; }
     snprintf(nr->service_id, sizeof(nr->service_id), "%s", service_id);
@@ -470,6 +547,7 @@ static int hs_intro_register(relay_state_t *st, const char *service_id, cell_con
 static cell_conn_t *hs_intro_lookup(relay_state_t *st, const char *service_id) {
     if (!st || !service_id) return NULL;
     pthread_mutex_lock(&st->hs_mu);
+    hs_prune_locked(st);
     intro_reg_t *it = st->intro_regs;
     while (it) {
         if (strcmp(it->service_id, service_id) == 0) {
@@ -487,10 +565,13 @@ static cell_conn_t *hs_intro_lookup(relay_state_t *st, const char *service_id) {
 static int hs_rdv_register(relay_state_t *st, const uint8_t cookie[20], cell_conn_t *cc) {
     if (!st || !cookie || !cc) return -1;
     pthread_mutex_lock(&st->hs_mu);
+    hs_prune_locked(st);
+    size_t count = 0;
 
     // reject duplicates
     rdv_reg_t *it = st->rdv_regs;
     while (it) {
+        count++;
         if (memcmp(it->cookie, cookie, 20) == 0) {
             pthread_mutex_unlock(&st->hs_mu);
             return -1;
@@ -498,6 +579,10 @@ static int hs_rdv_register(relay_state_t *st, const uint8_t cookie[20], cell_con
         it = it->next;
     }
 
+    if (st->cfg.hs_max_rdv && count >= st->cfg.hs_max_rdv) {
+        pthread_mutex_unlock(&st->hs_mu);
+        return -1;
+    }
     rdv_reg_t *nr = (rdv_reg_t*)calloc(1, sizeof(rdv_reg_t));
     if (!nr) { pthread_mutex_unlock(&st->hs_mu); return -1; }
     memcpy(nr->cookie, cookie, 20);
@@ -513,6 +598,7 @@ static int hs_rdv_register(relay_state_t *st, const uint8_t cookie[20], cell_con
 static cell_conn_t *hs_rdv_take(relay_state_t *st, const uint8_t cookie[20]) {
     if (!st || !cookie) return NULL;
     pthread_mutex_lock(&st->hs_mu);
+    hs_prune_locked(st);
     rdv_reg_t **pp = &st->rdv_regs;
     while (*pp) {
         if (memcmp((*pp)->cookie, cookie, 20) == 0) {
@@ -548,7 +634,7 @@ static int exit_process_stream_done(cell_conn_t *cc, uint16_t sid) {
     for (int i=0;i<32;i++) if (cc->streams[i].used && cc->streams[i].id == sid) { idx=i; break; }
     if (idx < 0) return -1;
     // connect dest
-    int fd = net_connect_tcp(cc->streams[idx].host, cc->streams[idx].port);
+    int fd = net_connect_tcp_policy(cc->streams[idx].host, cc->streams[idx].port, cc->st ? cc->st->cfg.allow_private_exit : false);
     if (fd < 0) {
         cc->streams[idx].used = 0;
         free(cc->streams[idx].req);
@@ -589,6 +675,28 @@ static int exit_process_stream_done(cell_conn_t *cc, uint16_t sid) {
 static int cell_handle_exit_plain(relay_state_t *st, cell_conn_t *cc, const uint8_t *plain, uint16_t plain_len) {
     uint8_t rcmd; uint16_t sid; const uint8_t *body; uint16_t bl;
     if (pcomm_relay_plain_unpack(plain, plain_len, &rcmd, &sid, &body, &bl) != 0) return -1;
+
+    /* Circuit keepalive and liveness check. */
+    if (rcmd == PCOMM_RELAY_PING) {
+        return exit_send_relay_plain(cc, PCOMM_RELAY_PONG, sid, body, bl);
+    }
+    if (rcmd == PCOMM_RELAY_PONG) {
+        return 0;
+    }
+
+    // Basic abuse throttling (exit-side).
+    uint32_t w = 1;
+    switch (rcmd) {
+        case PCOMM_RELAY_ESTABLISH_INTRO: w = 10; break;
+        case PCOMM_RELAY_INTRODUCE1: w = 20; break;
+        case PCOMM_RELAY_ESTABLISH_RENDEZVOUS: w = 10; break;
+        case PCOMM_RELAY_RENDEZVOUS1: w = 10; break;
+        case PCOMM_RELAY_BEGIN: w = 2; break;
+        default: w = 1; break;
+    }
+    if (!cc_rate_allow(cc, w)) {
+        return 0;
+    }
 
     // Rendezvous join mode: forward certain relay commands to the partner circuit.
     if (cc->rdv_partner) {
@@ -790,6 +898,7 @@ static int drain_up_queue(cell_conn_t *cc) {
             it = cc->qhead;
             cc->qhead = it->next;
             if (!cc->qhead) cc->qtail = NULL;
+            if (cc->qlen) cc->qlen--;
         }
         pthread_mutex_unlock(&cc->qmu);
         if (!it) break;
@@ -812,6 +921,8 @@ static int cell_loop(relay_state_t *st, int fd, const uint8_t *first_cell, uint3
     cc->conn_id = __sync_add_and_fetch(&st->next_conn_id, 1);
     cc->up_fd = fd;
     cc->down_fd = -1;
+    cc->last_activity = time(NULL);
+    cc->rl_window_start = cc->last_activity;
     cc->refcnt = 1;
     pthread_mutex_init(&cc->qmu, NULL);
 
@@ -835,6 +946,7 @@ static int cell_loop(relay_state_t *st, int fd, const uint8_t *first_cell, uint3
             break;
         }
         (void)flags;
+        cc->last_activity = time(NULL);
 
         if (cmd == PCOMM_CELL_CREATE) {
             if (cc->built || cpll != 32) { free(pending_payload); break; }
@@ -886,7 +998,11 @@ static int cell_loop(relay_state_t *st, int fd, const uint8_t *first_cell, uint3
         tv.tv_usec = 200 * 1000; // 200ms
         int sel = select(maxfd+1, &rfds, NULL, NULL, &tv);
         if (sel <= 0) {
-            // timeout: loop to drain queue
+            /* timeout: loop to drain queue, but close very idle circuits to avoid resource pinning */
+            time_t now = time(NULL);
+            if ((now - cc->last_activity) > 1800) {
+                break;
+            }
             continue;
         }
 
@@ -1106,6 +1222,10 @@ int pcomm_relay_start(const pcomm_config_t *cfg, const pcomm_identity_t *id, pco
     st->intro_regs = NULL;
     st->rdv_regs = NULL;
     st->next_conn_id = 1000;
+
+    // Hidden-service registry maintenance (expiry pruning).
+    pthread_t hst;
+    if (pthread_create(&hst, NULL, hs_maint_thread, st) == 0) pthread_detach(hst);
 
     st->listen_fd = net_listen_tcp(cfg->relay_host, cfg->relay_port, 64);
     if (st->listen_fd < 0) {

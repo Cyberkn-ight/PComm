@@ -147,7 +147,7 @@ static rdv_sess_t *rdv_find_session(hidden_state_t *st, const char *peer_id) {
     for (rdv_sess_t *s = st->sessions; s; s = s->next) {
         if (peer_id && peer_id[0] && strcmp(s->peer_id, peer_id) == 0) {
             // expire after 2 minutes idle
-            if ((now - s->last_used) < 120) best = s;
+            if ((now - s->last_used) < 900) best = s;
             break;
         }
     }
@@ -239,6 +239,29 @@ static void process_sealed_message(hidden_state_t *st, const uint8_t *sealed, ui
 }
 
 // circuit event callback: handles INTRODUCE2, RENDEZVOUS2, and rendezvous DATA cells.
+static void *session_gc_thread(void *arg) {
+    hidden_state_t *st = (hidden_state_t*)arg;
+    const int ttl = 20 * 60;
+    for (;;) {
+        time_t now = time(NULL);
+        pthread_mutex_lock(&st->rdv_mu);
+        rdv_sess_t **pp = &st->sessions;
+        while (*pp) {
+            rdv_sess_t *s = *pp;
+            if ((now - s->last_used) > ttl) {
+                *pp = s->next;
+                if (s->circ) pcomm_circuit_close(s->circ);
+                free(s);
+                continue;
+            }
+            pp = &(*pp)->next;
+        }
+        pthread_mutex_unlock(&st->rdv_mu);
+        sleep(10);
+    }
+    return NULL;
+}
+
 static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
                                  uint8_t relay_cmd, uint16_t stream_id,
                                  const uint8_t *body, uint16_t body_len);
@@ -948,7 +971,14 @@ static void *sync_thread(void *arg) {
             poll_mailbox_from_peer(st, &intros[i], infohash, mkey_prev);
         }
 
-        sleep(3);
+        {
+        uint8_t r2[2];
+        pcomm_random(r2, 2);
+        int base = (int)st->cfg.mailbox_poll_base_ms;
+        if (base < 800) base = 800;
+        int jitter = ((int)r2[0] << 8 | (int)r2[1]) % base;
+        usleep((useconds_t)1000 * (useconds_t)(base/2 + jitter));
+    }
     }
     return NULL;
 }
@@ -1005,6 +1035,7 @@ static void *cover_thread(void *arg) {
 }
 
 
+
 static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
                                  uint8_t relay_cmd, uint16_t stream_id,
                                  const uint8_t *body, uint16_t body_len) {
@@ -1059,13 +1090,15 @@ int pcomm_hidden_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pc
 
     g_hidden = st;
 
-    pthread_t th1, th2, th3;
+    pthread_t th1, th2, th3, th4;
     pthread_create(&th1, NULL, publish_thread, st);
     pthread_detach(th1);
     pthread_create(&th2, NULL, sync_thread, st);
     pthread_detach(th2);
     pthread_create(&th3, NULL, cover_thread, st);
     pthread_detach(th3);
+    pthread_create(&th4, NULL, session_gc_thread, st);
+    pthread_detach(th4);
 
     fprintf(stderr, "Hidden-service style mailbox started (publish/sync/cover)\n");
     return 0;

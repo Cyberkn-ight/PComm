@@ -121,6 +121,23 @@ int pcomm_db_init_schema(pcomm_db_t *pdb) {
 
     if (exec_sql(pdb->db, sql2) != 0) return -1;
 
+    // Settings + DHT node persistence (v5)
+    const char *sql3 =
+        "CREATE TABLE IF NOT EXISTS settings("
+        " key TEXT PRIMARY KEY,"
+        " value TEXT NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS dht_nodes("
+        " host TEXT NOT NULL,"
+        " port INTEGER NOT NULL,"
+        " node_id BLOB NOT NULL,"
+        " last_seen INTEGER NOT NULL,"
+        " PRIMARY KEY(host, port)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_dht_nodes_seen ON dht_nodes(last_seen);";
+
+    if (exec_sql(pdb->db, sql3) != 0) return -1;
+
     return 0;
 }
 
@@ -520,4 +537,87 @@ int pcomm_db_desc_get(pcomm_db_t *pdb, const uint8_t key[32], uint8_t **blob_out
     *blob_out = cpy;
     *blob_len_out = (uint32_t)bl;
     return 0;
+}
+
+// ---- settings KV ----
+
+int pcomm_db_kv_set(pcomm_db_t *pdb, const char *key, const char *value) {
+    if (!pdb || !pdb->db || !key || !value) return -1;
+    const char *sql =
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, value, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int pcomm_db_kv_get(pcomm_db_t *pdb, const char *key, char *value_out, size_t value_cap) {
+    if (!pdb || !pdb->db || !key || !value_out || value_cap == 0) return -1;
+    value_out[0] = '\0';
+    const char *sql = "SELECT value FROM settings WHERE key=?;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_ROW) { sqlite3_finalize(st); return -1; }
+    const char *v = (const char*)sqlite3_column_text(st, 0);
+    if (!v) { sqlite3_finalize(st); return -1; }
+    snprintf(value_out, value_cap, "%s", v);
+    sqlite3_finalize(st);
+    return 0;
+}
+
+// ---- DHT node persistence ----
+
+int pcomm_db_dhtnode_upsert(pcomm_db_t *pdb,
+                            const uint8_t node_id[20],
+                            const char *host,
+                            uint16_t port,
+                            int64_t last_seen_unix) {
+    if (!pdb || !pdb->db || !node_id || !host || port == 0) return -1;
+    const char *sql =
+        "INSERT INTO dht_nodes(host,port,node_id,last_seen) VALUES(?,?,?,?) "
+        "ON CONFLICT(host,port) DO UPDATE SET node_id=excluded.node_id, last_seen=excluded.last_seen;";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(st, 1, host, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, (int)port);
+    sqlite3_bind_blob(st, 3, node_id, 20, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, last_seen_unix);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return (rc == SQLITE_DONE) ? 0 : -1;
+}
+
+int pcomm_db_dhtnode_load_some(pcomm_db_t *pdb,
+                               char (*hosts)[64], uint16_t *ports, uint8_t (*node_ids)[20],
+                               size_t cap, size_t *out_len) {
+    if (!pdb || !pdb->db || !hosts || !ports || !node_ids || !out_len) return -1;
+    *out_len = 0;
+
+    const char *sql =
+        "SELECT host, port, node_id FROM dht_nodes "
+        "ORDER BY last_seen DESC LIMIT ?;";
+
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int(st, 1, (int)cap);
+
+    while (sqlite3_step(st) == SQLITE_ROW && *out_len < cap) {
+        const char *h = (const char*)sqlite3_column_text(st, 0);
+        int p = sqlite3_column_int(st, 1);
+        const void *nid = sqlite3_column_blob(st, 2);
+        int nid_len = sqlite3_column_bytes(st, 2);
+        if (!h || p <= 0 || p > 65535 || !nid || nid_len != 20) continue;
+        snprintf(hosts[*out_len], 64, "%s", h);
+        ports[*out_len] = (uint16_t)p;
+        memcpy(node_ids[*out_len], nid, 20);
+        (*out_len)++;
+    }
+
+    sqlite3_finalize(st);
+    return (*out_len > 0) ? 0 : -1;
 }

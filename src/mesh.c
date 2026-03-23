@@ -2,6 +2,7 @@
 #include "net.h"
 #include "proto.h"
 #include "identity.h"
+#include "crypto.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -161,7 +162,12 @@ static void *mesh_thread(void *arg) {
             }
         }
 
-        sleep(5);
+        uint8_t r[1];
+        pcomm_random(r, 1);
+        int base = (int)st->cfg.mesh_gossip_base_sec;
+        if (base < 3) base = 3;
+        int delay = base + (r[0] % base);
+        sleep(delay);
     }
     return NULL;
 }
