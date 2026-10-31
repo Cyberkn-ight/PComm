@@ -28,6 +28,7 @@ It is inspired from my good friend [S3](https://github.com/S3NP41-v) [Pcomm proj
 
 Requirements:
 - CMake
+- A C11 compiler and POSIX threads library
 - SQLite3 development headers
 - OpenSSL 3 (libssl/libcrypto)
 
@@ -38,6 +39,35 @@ cmake --build build -j
 ```
 
 Binary: `build/pcomm`
+
+### Windows development tools
+
+Use [MSYS2 UCRT64](https://www.msys2.org/docs/environments/) for the native Windows
+compiler and dependencies. Update MSYS2 with `pacman -Syu`, reopening the shell
+and repeating the update if requested. Then install these packages in its UCRT64
+shell:
+
+```bash
+pacman -S --needed mingw-w64-ucrt-x86_64-gcc \
+  mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+  mingw-w64-ucrt-x86_64-make mingw-w64-ucrt-x86_64-pkgconf \
+  mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-sqlite3 \
+  mingw-w64-ucrt-x86_64-winpthreads mingw-w64-ucrt-x86_64-gdb
+```
+
+For PowerShell, add the installation's `ucrt64\bin` directory (normally
+`C:\msys64\ucrt64\bin`) to your user PATH and restart the terminal. Configure in
+a separate directory:
+
+```powershell
+cmake -S . -B build-ucrt64 -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-ucrt64
+```
+
+Native Windows compilation currently needs source portability work for POSIX
+networking headers and socket APIs. Keep each platform/toolchain's build directory
+separate. Generated build files are ignored by Git, along with local identities,
+message databases, and `peers.txt`; share the example peer file instead.
 
 ## Run
 
