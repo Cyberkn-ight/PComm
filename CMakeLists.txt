@@ -19,6 +19,8 @@ add_executable(pcomm
     src/proto.c
     src/onion.c
     src/msg.c
+    src/receive.c
+    src/replay.c
     src/relay.c
     src/sendmsg.c
     src/mesh.c
@@ -32,4 +34,31 @@ add_executable(pcomm
 target_include_directories(pcomm PRIVATE src)
 
 target_link_libraries(pcomm PRIVATE sqlite3 ssl crypto pthread)
+
+if(WIN32)
+    target_link_libraries(pcomm PRIVATE ws2_32)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_replay_cache tests/test_replay_cache.c src/replay.c)
+    target_include_directories(test_replay_cache PRIVATE src)
+    target_link_libraries(test_replay_cache PRIVATE pthread)
+    add_test(NAME replay_cache COMMAND test_replay_cache)
+
+    add_executable(test_receive
+        tests/test_receive.c
+        src/receive.c
+        src/replay.c
+        src/crypto.c
+        src/msg.c
+        src/db.c
+    )
+    target_include_directories(test_receive PRIVATE src)
+    target_link_libraries(test_receive PRIVATE sqlite3 crypto pthread)
+    if(WIN32)
+        target_link_libraries(test_receive PRIVATE ws2_32)
+    endif()
+    add_test(NAME receive_replay COMMAND test_receive)
+endif()
 

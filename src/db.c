@@ -3,7 +3,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 static int exec_sql(sqlite3 *db, const char *sql) {
     char *err = NULL;
@@ -43,6 +47,13 @@ int pcomm_db_open(pcomm_db_t *pdb, const char *data_dir) {
     }
     sqlite3_busy_timeout(pdb->db, 2000);
 
+    pdb->replay_cache = pcomm_replay_cache_create(PCOMM_REPLAY_CACHE_CAPACITY, PCOMM_REPLAY_CACHE_TTL_MS);
+    if (!pdb->replay_cache) {
+        sqlite3_close(pdb->db);
+        pdb->db = NULL;
+        return -1;
+    }
+
     exec_sql(pdb->db, "PRAGMA foreign_keys=ON;");
     return 0;
 }
@@ -51,6 +62,8 @@ void pcomm_db_close(pcomm_db_t *pdb) {
     if (!pdb) return;
     if (pdb->db) sqlite3_close(pdb->db);
     pdb->db = NULL;
+    pcomm_replay_cache_destroy(pdb->replay_cache);
+    pdb->replay_cache = NULL;
 }
 
 int pcomm_db_init_schema(pcomm_db_t *pdb) {

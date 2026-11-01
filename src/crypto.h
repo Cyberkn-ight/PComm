@@ -4,6 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The sealed-message wire prefix is an X25519 ephemeral public key. */
+#define PCOMM_SEAL_EPH_PUB_LEN 32u
+
 int pcomm_x25519_derive(const uint8_t priv[32], const uint8_t pub[32], uint8_t out_shared[32]);
 int pcomm_hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
                       const uint8_t *salt, size_t salt_len,

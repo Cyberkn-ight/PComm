@@ -8,6 +8,7 @@
 #include "msg.h"
 #include "dht.h"
 #include "circuit.h"
+#include "receive.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -185,48 +186,6 @@ static void rdv_mark_established(hidden_state_t *st, const uint8_t cookie[20]) {
         }
     }
     pthread_mutex_unlock(&st->rdv_mu);
-}
-
-static void process_sealed_message(hidden_state_t *st, const uint8_t *sealed, uint32_t sealed_len, uint32_t fallback_ts) {
-    uint8_t *plain = NULL; size_t plain_len = 0;
-    if (pcomm_open_seal(st->me.privkey, sealed, sealed_len, &plain, &plain_len) != 0) return;
-
-    pcomm_plain_kind_t kind;
-    uint32_t mts = 0;
-    char sender[96] = {0};
-    char group_uuid[64] = {0};
-    char *title = NULL;
-    char **members = NULL; int member_count = 0;
-    char *text = NULL;
-
-    if (pcomm_msg_unpack_any(plain, plain_len, &kind, &mts, sender, sizeof(sender),
-                             group_uuid, sizeof(group_uuid),
-                             &title, &members, &member_count, &text) == 0) {
-        uint32_t ts = mts ? mts : fallback_ts;
-        if (kind == PCOMM_PLAIN_DIRECT_TEXT) {
-            int64_t conv_id = pcomm_db_get_or_create_direct_conv(st->db, sender);
-            if (conv_id >= 0) {
-                pcomm_db_insert_message(st->db, conv_id, 0, sender, sender, text ? text : "", sealed, sealed_len, (int64_t)ts);
-            }
-        } else if (kind == PCOMM_PLAIN_GROUP_INVITE) {
-            int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, title ? title : "");
-            if (conv_id >= 0) {
-                for (int k = 0; k < member_count; k++) pcomm_db_add_participant(st->db, conv_id, members[k]);
-                const char *body = title ? title : "Group invite";
-                pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, body, sealed, sealed_len, (int64_t)ts);
-            }
-        } else if (kind == PCOMM_PLAIN_GROUP_TEXT) {
-            int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, NULL);
-            if (conv_id >= 0) {
-                pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, text ? text : "", sealed, sealed_len, (int64_t)ts);
-            }
-        }
-    }
-
-    free(plain);
-    free(title);
-    pcomm_msg_free_members(members, member_count);
-    free(text);
 }
 
 static void *session_gc_thread(void *arg) {
@@ -823,54 +782,15 @@ static int parse_mb_resp_items(hidden_state_t *st, const uint8_t *payload, uint3
     uint16_t count = get_u16(payload + off); off += 2;
 
     for (uint16_t i = 0; i < count; i++) {
-        if (payload_len < off + 8 + 4 + 4) break;
+        if (payload_len - off < 8 + 4 + 4) break;
         off += 8;
         uint32_t ts = get_u32(payload + off); off += 4;
         uint32_t bl = get_u32(payload + off); off += 4;
-        if (payload_len < off + bl) break;
+        if (bl > payload_len - off) break;
         const uint8_t *sealed = payload + off;
         off += bl;
 
-        uint8_t *plain = NULL; size_t plain_len = 0;
-        if (pcomm_open_seal(st->me.privkey, sealed, bl, &plain, &plain_len) != 0) continue;
-
-        pcomm_plain_kind_t kind;
-        uint32_t mts = 0;
-        char sender[96] = {0};
-        char group_uuid[64] = {0};
-        char *title = NULL;
-        char **members = NULL; int member_count = 0;
-        char *text = NULL;
-
-        if (pcomm_msg_unpack_any(plain, plain_len, &kind, &mts, sender, sizeof(sender),
-                                 group_uuid, sizeof(group_uuid),
-                                 &title, &members, &member_count, &text) == 0) {
-            if (kind == PCOMM_PLAIN_DIRECT_TEXT) {
-                int64_t conv_id = pcomm_db_get_or_create_direct_conv(st->db, sender);
-                if (conv_id >= 0) {
-                    pcomm_db_insert_message(st->db, conv_id, 0, sender, sender, text ? text : "", sealed, bl, (int64_t)(mts ? mts : ts));
-                }
-            } else if (kind == PCOMM_PLAIN_GROUP_INVITE) {
-                int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, title ? title : "");
-                if (conv_id >= 0) {
-                    for (int k = 0; k < member_count; k++) {
-                        pcomm_db_add_participant(st->db, conv_id, members[k]);
-                    }
-                    const char *body = title ? title : "Group invite";
-                    pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, body, sealed, bl, (int64_t)(mts ? mts : ts));
-                }
-            } else if (kind == PCOMM_PLAIN_GROUP_TEXT) {
-                int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, NULL);
-                if (conv_id >= 0) {
-                    pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, text ? text : "", sealed, bl, (int64_t)(mts ? mts : ts));
-                }
-            }
-        }
-
-        free(plain);
-        free(title);
-        pcomm_msg_free_members(members, member_count);
-        free(text);
+        (void)pcomm_receive_sealed(st->db, &st->me, sealed, bl, ts);
     }
 
     return 0;
@@ -1020,7 +940,7 @@ static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
         uint8_t *pl = NULL; uint32_t pll = 0;
         if (pcomm_unpack_packet(body, (uint32_t)body_len, &mt, eph, &pl, &pll) == 0) {
             if (mt == PCOMM_MSG_DELIVER && pl && pll > 0) {
-                process_sealed_message(st, pl, pll, (uint32_t)time(NULL));
+                (void)pcomm_receive_sealed(st->db, &st->me, pl, pll, (uint32_t)time(NULL));
             }
             free(pl);
         }

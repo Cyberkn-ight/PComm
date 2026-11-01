@@ -4,9 +4,11 @@
 #include <sqlite3.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "replay.h"
 
 typedef struct {
     sqlite3 *db;
+    pcomm_replay_cache_t *replay_cache;
 } pcomm_db_t;
 
 int pcomm_db_open(pcomm_db_t *pdb, const char *data_dir);

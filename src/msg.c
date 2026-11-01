@@ -1,7 +1,11 @@
 #include "msg.h"
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 static void put_u16(uint8_t *p, uint16_t v) { uint16_t n = htons(v); memcpy(p,&n,2); }
 static void put_u32(uint8_t *p, uint32_t v) { uint32_t n = htonl(v); memcpy(p,&n,4); }

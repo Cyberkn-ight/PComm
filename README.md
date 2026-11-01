@@ -69,6 +69,20 @@ networking headers and socket APIs. Keep each platform/toolchain's build directo
 separate. Generated build files are ignored by Git, along with local identities,
 message databases, and `peers.txt`; share the example peer file instead.
 
+### Replay protection tests
+
+The receive path has focused regression tests using real OpenSSL encryption and
+an in-memory SQLite database:
+
+```bash
+cmake -S . -B build-tests -G Ninja -DBUILD_TESTING=ON
+cmake --build build-tests --target test_replay_cache test_receive
+ctest --test-dir build-tests --output-on-failure
+```
+
+These test targets also build with the Windows toolchain above, independently of
+the application's remaining POSIX networking dependencies.
+
 ## Run
 
 ```bash
@@ -124,6 +138,17 @@ You can send to a user just by their ID:
   - otherwise it falls back to mailbox dead-drops stored on relays discovered via the DHT
 
 The recipient periodically polls mailboxes and stores messages locally.
+
+Incoming mailbox, rendezvous, and legacy direct deliveries share a bounded cache
+of 4,096 SHA-256 hashes of successfully stored nonce/ciphertext/tag tuples.
+Equivalent X25519 ephemeral public-key encodings share the same fingerprint, so
+changing only that header cannot bypass replay rejection. Repeated envelopes
+still in the cache are silently ignored before message or group-invite
+side effects. Invalid messages and failed storage attempts do not occupy entries.
+The cache stores no plaintext and expires entries 24 hours after acceptance, using
+local monotonic time. It is process-local: restarting clears it, and LRU eviction
+can shorten the replay window. It does not authenticate sender identity or reject
+the same plaintext encrypted into a different envelope.
 
 ## Group chats (prototype)
 

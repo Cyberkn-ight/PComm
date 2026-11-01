@@ -8,6 +8,7 @@
 #include "db.h"
 #include "cell.h"
 #include "dht.h"
+#include "receive.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -1059,44 +1060,7 @@ static void *handle_conn(void *arg) {
             free(deliver_payload);
         }
     } else if (type == PCOMM_MSG_DELIVER) {
-        uint8_t *plain = NULL;
-        size_t plain_len = 0;
-        if (pcomm_open_seal(st->id.privkey, payload, payload_len, &plain, &plain_len) == 0) {
-            pcomm_plain_kind_t kind;
-            uint32_t ts = 0;
-            char sender[96] = {0};
-            char group_uuid[64] = {0};
-            char *title = NULL;
-            char **members = NULL; int member_count = 0;
-            char *text = NULL;
-
-            if (pcomm_msg_unpack_any(plain, plain_len, &kind, &ts, sender, sizeof(sender),
-                                     group_uuid, sizeof(group_uuid),
-                                     &title, &members, &member_count, &text) == 0) {
-                if (kind == PCOMM_PLAIN_DIRECT_TEXT) {
-                    int64_t conv_id = pcomm_db_get_or_create_direct_conv(st->db, sender);
-                    if (conv_id >= 0) {
-                        pcomm_db_insert_message(st->db, conv_id, 0, sender, sender, text ? text : "", payload, payload_len, (int64_t)ts);
-                    }
-                } else if (kind == PCOMM_PLAIN_GROUP_INVITE) {
-                    int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, title ? title : "");
-                    if (conv_id >= 0) {
-                        for (int k = 0; k < member_count; k++) pcomm_db_add_participant(st->db, conv_id, members[k]);
-                        const char *body = title ? title : "Group invite";
-                        pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, body, payload, payload_len, (int64_t)ts);
-                    }
-                } else if (kind == PCOMM_PLAIN_GROUP_TEXT) {
-                    int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, NULL);
-                    if (conv_id >= 0) {
-                        pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, text ? text : "", payload, payload_len, (int64_t)ts);
-                    }
-                }
-            }
-            free(plain);
-            free(title);
-            pcomm_msg_free_members(members, member_count);
-            free(text);
-        }
+        (void)pcomm_receive_sealed(st->db, &st->id, payload, payload_len, 0);
     } else if (type == PCOMM_MSG_CTRL) {
         ctrl_handle(st, fd, payload, payload_len);
     }
