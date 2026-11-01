@@ -7,6 +7,9 @@
 #include <stddef.h>
 
 int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db);
+/* Wake pending queries first; keep state alive until DHT consumers have stopped. */
+void pcomm_dht_request_stop(void);
+void pcomm_dht_stop(void);
 
 void pcomm_dht_infohash_desc(const char *user_id, uint8_t out20[20]);
 void pcomm_dht_infohash_mb(const char *user_id, uint8_t out20[20]);

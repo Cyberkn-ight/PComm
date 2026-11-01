@@ -5,5 +5,6 @@
 #include "db.h"
 
 int pcomm_mesh_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db);
+void pcomm_mesh_stop(void);
 
 #endif

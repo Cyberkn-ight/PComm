@@ -8,14 +8,18 @@
 #include "hidden.h"
 #include "db.h"
 #include "crypto.h"
+#include "lifecycle.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
+#include <openssl/crypto.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sqlite3.h>
@@ -25,7 +29,19 @@ typedef struct {
     pcomm_identity_t me;
     pcomm_db_t *db;
     int listen_fd;
+    int client_fd;
+    atomic_int stopping;
+    pthread_mutex_t io_mu;
+    pthread_t thread;
+    int thread_started;
 } http_state_t;
+
+static http_state_t *g_http = NULL;
+static pthread_mutex_t g_http_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int http_stopping(const http_state_t *st) {
+    return atomic_load(&st->stopping) || pcomm_shutdown_requested();
+}
 
 static const char *mime_from_path(const char *path) {
     const char *ext = strrchr(path, '.');
@@ -396,109 +412,153 @@ static int route_request(http_state_t *st, int fd, const char *method, const cha
     return serve_file(fd, st->cfg.ui_dir, path);
 }
 
+static void http_handle_client(http_state_t *st, int cfd) {
+    if (http_stopping(st)) return;
+    char req[8192];
+    ssize_t n = recv(cfd, req, sizeof(req) - 1, 0);
+    if (n <= 0 || http_stopping(st)) return;
+    req[n] = '\0';
+
+    char *hdr_end = strstr(req, "\r\n\r\n");
+    if (!hdr_end) { send_resp(cfd, 400, "text/plain", "bad request", 11); return; }
+    size_t header_len = (size_t)(hdr_end - req) + 4;
+    char *body = req + header_len;
+    size_t body_len = (size_t)n - header_len;
+    char method[8] = {0};
+    char target[1024] = {0};
+    if (sscanf(req, "%7s %1023s", method, target) != 2) {
+        send_resp(cfd, 400, "text/plain", "bad request", 11);
+        return;
+    }
+
+    size_t content_len = 0;
+    const char *cl = strcasestr(req, "Content-Length:");
+    if (cl) {
+        cl += strlen("Content-Length:");
+        while (*cl == ' ') cl++;
+        content_len = (size_t)atoi(cl);
+    }
+    while (!http_stopping(st) && body_len < content_len && header_len + body_len < sizeof(req) - 1) {
+        ssize_t m = recv(cfd, req + n, (sizeof(req) - 1) - (size_t)n, 0);
+        if (m <= 0) break;
+        n += m;
+        req[n] = '\0';
+        body = req + header_len;
+        body_len = (size_t)n - header_len;
+    }
+    if (http_stopping(st)) return;
+    if (content_len > body_len) {
+        send_resp(cfd, 400, "text/plain", "body too large", 14);
+        return;
+    }
+
+    char path[1024] = {0};
+    char *q = strchr(target, '?');
+    const char *query = NULL;
+    if (q) {
+        size_t plen = (size_t)(q - target);
+        if (plen >= sizeof(path)) plen = sizeof(path)-1;
+        memcpy(path, target, plen);
+        path[plen] = '\0';
+        query = q + 1;
+    } else {
+        snprintf(path, sizeof(path), "%s", target);
+    }
+    char *body_copy = NULL;
+    if (content_len > 0) {
+        body_copy = (char*)malloc(content_len + 1);
+        if (!body_copy) return;
+        memcpy(body_copy, body, content_len);
+        body_copy[content_len] = '\0';
+    }
+    if (!http_stopping(st)) route_request(st, cfd, method, path, query, body_copy);
+    free(body_copy);
+}
+
 static void *http_thread(void *arg) {
     http_state_t *st = (http_state_t*)arg;
-
-    for (;;) {
+    while (!http_stopping(st)) {
         int cfd = net_accept(st->listen_fd, NULL, 0, NULL);
-        if (cfd < 0) continue;
-
-        char req[8192];
-        ssize_t n = recv(cfd, req, sizeof(req) - 1, 0);
-        if (n <= 0) { close(cfd); continue; }
-        req[n] = '\0';
-
-        char *hdr_end = strstr(req, "\r\n\r\n");
-        if (!hdr_end) { send_resp(cfd, 400, "text/plain", "bad request", 11); close(cfd); continue; }
-
-        size_t header_len = (size_t)(hdr_end - req) + 4;
-        char *body = req + header_len;
-        size_t body_len = (size_t)n - header_len;
-
-        char method[8] = {0};
-        char target[1024] = {0};
-        if (sscanf(req, "%7s %1023s", method, target) != 2) {
-            send_resp(cfd, 400, "text/plain", "bad request", 11);
-            close(cfd);
+        if (cfd < 0) {
+            int accept_error = errno;
+            if (http_stopping(st)) break;
+            if (accept_error == EBADF || accept_error == EINVAL || accept_error == ENOTSOCK) break;
+            if (accept_error != EAGAIN && accept_error != EWOULDBLOCK &&
+                accept_error != EINTR && pcomm_shutdown_wait(25) != 0) break;
             continue;
         }
-
-        size_t content_len = 0;
-        const char *cl = strcasestr(req, "Content-Length:");
-        if (cl) {
-            cl += strlen("Content-Length:");
-            while (*cl == ' ') cl++;
-            content_len = (size_t)atoi(cl);
+        pthread_mutex_lock(&st->io_mu);
+        if (http_stopping(st)) {
+            net_close(cfd);
+            pthread_mutex_unlock(&st->io_mu);
+            break;
         }
+        st->client_fd = cfd;
+        pthread_mutex_unlock(&st->io_mu);
 
-        while (body_len < content_len && header_len + body_len < sizeof(req) - 1) {
-            ssize_t m = recv(cfd, req + n, (sizeof(req) - 1) - (size_t)n, 0);
-            if (m <= 0) break;
-            n += m;
-            req[n] = '\0';
-            body = req + header_len;
-            body_len = (size_t)n - header_len;
-        }
+        http_handle_client(st, cfd);
 
-        if (content_len > body_len) {
-            send_resp(cfd, 400, "text/plain", "body too large", 14);
-            close(cfd);
-            continue;
-        }
-
-        char path[1024] = {0};
-        char *q = strchr(target, '?');
-        const char *query = NULL;
-        if (q) {
-            size_t plen = (size_t)(q - target);
-            if (plen >= sizeof(path)) plen = sizeof(path)-1;
-            memcpy(path, target, plen);
-            path[plen] = '\0';
-            query = q + 1;
-        } else {
-            snprintf(path, sizeof(path), "%s", target);
-        }
-
-        char *body_copy = NULL;
-        if (content_len > 0) {
-            body_copy = (char*)malloc(content_len + 1);
-            if (!body_copy) { close(cfd); continue; }
-            memcpy(body_copy, body, content_len);
-            body_copy[content_len] = '\0';
-        }
-
-        route_request(st, cfd, method, path, query, body_copy);
-
-        free(body_copy);
-        close(cfd);
+        pthread_mutex_lock(&st->io_mu);
+        st->client_fd = -1;
+        net_close(cfd);
+        pthread_mutex_unlock(&st->io_mu);
     }
     return NULL;
 }
 
 int pcomm_http_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db) {
-    if (!cfg || !me || !db) return -1;
+    if (!cfg || !me || !db || !db->db || pcomm_shutdown_requested()) return -1;
+    pthread_mutex_lock(&g_http_mu);
+    if (g_http) { pthread_mutex_unlock(&g_http_mu); return -1; }
 
-    http_state_t *st = (http_state_t*)calloc(1, sizeof(http_state_t));
-    if (!st) return -1;
+    http_state_t *st = (http_state_t*)calloc(1, sizeof(*st));
+    if (!st) { pthread_mutex_unlock(&g_http_mu); return -1; }
+    st->listen_fd = st->client_fd = -1;
+    atomic_init(&st->stopping, 0);
     st->cfg = *cfg;
     st->me = *me;
     st->db = db;
-
+    if (pthread_mutex_init(&st->io_mu, NULL) != 0) {
+        OPENSSL_cleanse(&st->me, sizeof(st->me));
+        free(st);
+        pthread_mutex_unlock(&g_http_mu);
+        return -1;
+    }
     st->listen_fd = net_listen_tcp(cfg->http_host, cfg->http_port, 64);
     if (st->listen_fd < 0) {
         fprintf(stderr, "Failed to listen on http %s:%u\n", cfg->http_host, (unsigned)cfg->http_port);
-        free(st);
-        return -1;
+        goto failed;
     }
-
-    pthread_t th;
-    if (pthread_create(&th, NULL, http_thread, st) != 0) {
-        close(st->listen_fd);
-        free(st);
-        return -1;
-    }
-    pthread_detach(th);
-
+    if (pthread_create(&st->thread, NULL, http_thread, st) != 0) goto failed;
+    st->thread_started = 1;
+    g_http = st;
+    pthread_mutex_unlock(&g_http_mu);
     fprintf(stderr, "HTTP UI listening on http://%s:%u\n", cfg->http_host, (unsigned)cfg->http_port);
     return 0;
+failed:
+    if (st->listen_fd >= 0) net_close(st->listen_fd);
+    pthread_mutex_destroy(&st->io_mu);
+    OPENSSL_cleanse(&st->me, sizeof(st->me));
+    free(st);
+    pthread_mutex_unlock(&g_http_mu);
+    return -1;
+}
+
+void pcomm_http_stop(void) {
+    pthread_mutex_lock(&g_http_mu);
+    http_state_t *st = g_http;
+    g_http = NULL;
+    if (st) {
+        atomic_store(&st->stopping, 1);
+        pthread_mutex_lock(&st->io_mu);
+        net_shutdown(st->listen_fd);
+        if (st->client_fd >= 0) net_shutdown(st->client_fd);
+        pthread_mutex_unlock(&st->io_mu);
+        if (st->thread_started) pthread_join(st->thread, NULL);
+        net_close(st->listen_fd);
+        pthread_mutex_destroy(&st->io_mu);
+        OPENSSL_cleanse(&st->me, sizeof(st->me));
+        free(st);
+    }
+    pthread_mutex_unlock(&g_http_mu);
 }

@@ -3,6 +3,7 @@
 #include "bencode.h"
 #include "crypto.h"
 #include "net.h"
+#include "lifecycle.h"
 
 #include <pthread.h>
 #include <openssl/sha.h>
@@ -14,6 +15,7 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <errno.h>
 
 
@@ -53,12 +55,17 @@ typedef struct {
     uint16_t listen_port;
 
     int running;
-    int maint_interval_sec;
+    uint32_t maint_interval_sec;
     int allow_private_addrs;
 
     pthread_t rx_th;
     pthread_t maint_th;
+    int rx_started;
+    int maint_started;
     pthread_mutex_t mu;
+    pthread_cond_t users_done;
+    size_t active_calls;
+    size_t pending_initialized;
 
     dht_node_t nodes[DHT_MAX_NODES];
     size_t nodes_len;
@@ -71,6 +78,54 @@ typedef struct {
 } dht_state_t;
 
 static dht_state_t *g_dht = NULL;
+static pthread_mutex_t g_dht_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int dht_running(dht_state_t *st) {
+    pthread_mutex_lock(&st->mu);
+    int running = st->running;
+    pthread_mutex_unlock(&st->mu);
+    return running && !pcomm_shutdown_requested();
+}
+
+static dht_state_t *dht_acquire(void) {
+    if (pcomm_shutdown_requested()) return NULL;
+    pthread_mutex_lock(&g_dht_mu);
+    dht_state_t *st = g_dht;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        int usable = st->running && !pcomm_shutdown_requested();
+        if (usable) st->active_calls++;
+        pthread_mutex_unlock(&st->mu);
+        if (!usable) st = NULL;
+    }
+    pthread_mutex_unlock(&g_dht_mu);
+    return st;
+}
+
+static void dht_release(dht_state_t *st) {
+    pthread_mutex_lock(&st->mu);
+    st->active_calls--;
+    if (st->active_calls == 0) pthread_cond_broadcast(&st->users_done);
+    pthread_mutex_unlock(&st->mu);
+}
+
+static void dht_request_stop_state(dht_state_t *st) {
+    pthread_mutex_lock(&st->mu);
+    st->running = 0;
+    for (size_t i = 0; i < st->pending_initialized; i++) {
+        pthread_cond_broadcast(&st->pending[i].cv);
+    }
+    pthread_mutex_unlock(&st->mu);
+}
+
+static int dht_wait(dht_state_t *st, uint64_t milliseconds) {
+    while (milliseconds > 0 && dht_running(st)) {
+        uint32_t chunk = milliseconds > 100u ? 100u : (uint32_t)milliseconds;
+        if (pcomm_shutdown_wait(chunk) != 0) return -1;
+        milliseconds -= chunk;
+    }
+    return dht_running(st) ? 0 : -1;
+}
 
 static void sha1_bytes(const uint8_t *in, size_t in_len, uint8_t out20[20]) {
     SHA_CTX c;
@@ -217,7 +272,6 @@ static pending_t *pending_alloc_locked(dht_state_t *st, uint16_t tx) {
             st->pending[i].done = 0;
             st->pending[i].tx = tx;
             st->pending[i].resp = NULL;
-            pthread_cond_init(&st->pending[i].cv, NULL);
             return &st->pending[i];
         }
     }
@@ -235,13 +289,13 @@ static void pending_free_locked(pending_t *p) {
     if (!p) return;
     benc_free(p->resp);
     p->resp = NULL;
-    pthread_cond_destroy(&p->cv);
     p->used = 0;
     p->done = 0;
     p->tx = 0;
 }
 
 static int send_krpc(dht_state_t *st, const struct sockaddr_in *to, const benc_t *msg) {
+    if (!dht_running(st)) return -1;
     uint8_t *buf = NULL;
     size_t len = 0;
     if (benc_encode(msg, &buf, &len) != 0) return -1;
@@ -425,7 +479,7 @@ static void handle_response(dht_state_t *st, benc_t *msg) {
 
     pthread_mutex_lock(&st->mu);
     pending_t *p = pending_find_locked(st, tx);
-    if (p) {
+    if (p && st->running && !p->done) {
         p->resp = msg;
         p->done = 1;
         pthread_cond_broadcast(&p->cv);
@@ -440,11 +494,12 @@ static void *dht_rx_thread(void *arg) {
     dht_state_t *st = (dht_state_t*)arg;
     uint8_t buf[4096];
 
-    while (st->running) {
+    while (dht_running(st)) {
         struct sockaddr_in from;
         socklen_t fl = sizeof(from);
         ssize_t n = recvfrom(st->udp_fd, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fl);
         if (n <= 0) continue;
+        if (!dht_running(st)) break;
 
         benc_t *msg = NULL;
         size_t used = 0;
@@ -524,6 +579,10 @@ static int krpc_query_one(dht_state_t *st, const struct sockaddr_in *to, benc_t 
     uint16_t tx = (uint16_t)((t->s[0] << 8) | t->s[1]);
 
     pthread_mutex_lock(&st->mu);
+    if (!st->running || pcomm_shutdown_requested()) {
+        pthread_mutex_unlock(&st->mu);
+        return -1;
+    }
     pending_t *p = pending_alloc_locked(st, tx);
     pthread_mutex_unlock(&st->mu);
     if (!p) return -1;
@@ -536,15 +595,19 @@ static int krpc_query_one(dht_state_t *st, const struct sockaddr_in *to, benc_t 
     }
 
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += 1000 * 1000 * 1000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        pthread_mutex_lock(&st->mu);
+        pending_free_locked(p);
+        pthread_mutex_unlock(&st->mu);
+        return -1;
+    }
+    ts.tv_sec += 1;
 
     pthread_mutex_lock(&st->mu);
-    while (!p->done) {
-        if (pthread_cond_timedwait(&p->cv, &st->mu, &ts) == ETIMEDOUT) break;
+    while (!p->done && st->running && !pcomm_shutdown_requested()) {
+        if (pthread_cond_timedwait(&p->cv, &st->mu, &ts) != 0) break;
     }
-    if (p->done && p->resp) {
+    if (st->running && !pcomm_shutdown_requested() && p->done && p->resp) {
         *resp_out = p->resp;
         p->resp = NULL;
     }
@@ -603,7 +666,7 @@ static void dht_refresh_once(dht_state_t *st) {
     uint8_t target[20];
     (void)pcomm_random(target, 20);
 
-    for (size_t i = 0; i < wlen; i++) {
+    for (size_t i = 0; i < wlen && dht_running(st); i++) {
         uint16_t tx = rand_tx();
         benc_t *q = krpc_build_query(st, tx, "ping", benc_new_dict());
         if (!q) continue;
@@ -619,6 +682,7 @@ static void dht_refresh_once(dht_state_t *st) {
             benc_free(resp);
         }
         benc_free(q);
+        if (!dht_running(st)) break;
 
         uint16_t tx2 = rand_tx();
         benc_t *a2 = benc_new_dict();
@@ -642,10 +706,10 @@ static void dht_refresh_once(dht_state_t *st) {
 
 static void *dht_maint_thread(void *arg) {
     dht_state_t *st = (dht_state_t*)arg;
-    while (st->running) {
+    while (dht_running(st)) {
         dht_refresh_once(st);
         dht_flush_nodes_to_db(st);
-        sleep((unsigned)st->maint_interval_sec);
+        if (dht_wait(st, (uint64_t)st->maint_interval_sec * 1000u) != 0) break;
     }
     return NULL;
 }
@@ -653,27 +717,29 @@ static void *dht_maint_thread(void *arg) {
 int pcomm_dht_get_peers_hosts(const uint8_t infohash20[20],
                              char (*hosts)[64], uint16_t *ports,
                              size_t cap, size_t *out_len) {
-    if (!g_dht || !hosts || !ports || !out_len || !infohash20) return -1;
-    *out_len = 0;
+    if (out_len) *out_len = 0;
+    if (!hosts || !ports || !out_len || !infohash20) return -1;
+    dht_state_t *st = dht_acquire();
+    if (!st) return -1;
 
     struct sockaddr_in work[128];
     size_t wlen = 0;
 
-    pthread_mutex_lock(&g_dht->mu);
-    size_t take = g_dht->nodes_len < DHT_QUERY_FANOUT ? g_dht->nodes_len : DHT_QUERY_FANOUT;
-    for (size_t i = 0; i < take; i++) work[wlen++] = g_dht->nodes[i].addr;
-    pthread_mutex_unlock(&g_dht->mu);
+    pthread_mutex_lock(&st->mu);
+    size_t take = st->nodes_len < DHT_QUERY_FANOUT ? st->nodes_len : DHT_QUERY_FANOUT;
+    for (size_t i = 0; i < take; i++) work[wlen++] = st->nodes[i].addr;
+    pthread_mutex_unlock(&st->mu);
 
     size_t queried = 0;
-    for (size_t wi = 0; wi < wlen && queried < 64 && *out_len < cap; wi++, queried++) {
+    for (size_t wi = 0; wi < wlen && queried < 64 && *out_len < cap && dht_running(st); wi++, queried++) {
         uint16_t tx = rand_tx();
         benc_t *a = benc_new_dict();
         benc_dict_set(a, "info_hash", benc_new_str(infohash20, 20));
-        benc_t *q = krpc_build_query(g_dht, tx, "get_peers", a);
+        benc_t *q = krpc_build_query(st, tx, "get_peers", a);
         if (!q) continue;
 
         benc_t *resp = NULL;
-        if (krpc_query_one(g_dht, &work[wi], q, &resp) == 0 && resp) {
+        if (krpc_query_one(st, &work[wi], q, &resp) == 0 && resp) {
             benc_t *r = benc_dict_get(resp, "r");
             if (r && r->t == BENC_DICT) {
                 benc_t *vals = benc_dict_get(r, "values");
@@ -687,7 +753,7 @@ int pcomm_dht_get_peers_hosts(const uint8_t infohash20[20],
                         memcpy(&p, s->s + 4, 2);
                         p = ntohs(p);
                         if (p == 0) continue;
-                        if (!g_dht->allow_private_addrs && net_addr_is_private(&ip, AF_INET)) continue;
+                        if (!st->allow_private_addrs && net_addr_is_private(&ip, AF_INET)) continue;
                         char ipstr[64];
                         inet_ntop(AF_INET, &ip, ipstr, sizeof(ipstr));
                         snprintf(hosts[*out_len], 64, "%s", ipstr);
@@ -698,7 +764,7 @@ int pcomm_dht_get_peers_hosts(const uint8_t infohash20[20],
 
                 benc_t *nodes = benc_dict_get(r, "nodes");
                 if (nodes && nodes->t == BENC_STR && nodes->slen >= 26) {
-                    parse_nodes_into_state(g_dht, nodes->s, nodes->slen);
+                    parse_nodes_into_state(st, nodes->s, nodes->slen);
                 }
             }
             benc_free(resp);
@@ -706,36 +772,41 @@ int pcomm_dht_get_peers_hosts(const uint8_t infohash20[20],
         benc_free(q);
     }
 
-    return (*out_len > 0) ? 0 : -1;
+    int rc = (*out_len > 0 && dht_running(st)) ? 0 : -1;
+    if (rc != 0) *out_len = 0;
+    dht_release(st);
+    return rc;
 }
 
 int pcomm_dht_announce(const uint8_t infohash20[20], uint16_t port) {
-    if (!g_dht || !infohash20 || port == 0) return -1;
+    if (!infohash20 || port == 0) return -1;
+    dht_state_t *st = dht_acquire();
+    if (!st) return -1;
 
     struct sockaddr_in nodes[DHT_QUERY_FANOUT];
     size_t nlen = 0;
-    pthread_mutex_lock(&g_dht->mu);
-    size_t take = g_dht->nodes_len < DHT_QUERY_FANOUT ? g_dht->nodes_len : DHT_QUERY_FANOUT;
-    for (size_t i = 0; i < take; i++) nodes[nlen++] = g_dht->nodes[i].addr;
-    pthread_mutex_unlock(&g_dht->mu);
+    pthread_mutex_lock(&st->mu);
+    size_t take = st->nodes_len < DHT_QUERY_FANOUT ? st->nodes_len : DHT_QUERY_FANOUT;
+    for (size_t i = 0; i < take; i++) nodes[nlen++] = st->nodes[i].addr;
+    pthread_mutex_unlock(&st->mu);
 
-    for (size_t i = 0; i < nlen; i++) {
+    for (size_t i = 0; i < nlen && dht_running(st); i++) {
         uint16_t tx = rand_tx();
         benc_t *a = benc_new_dict();
         benc_dict_set(a, "info_hash", benc_new_str(infohash20, 20));
-        benc_t *q = krpc_build_query(g_dht, tx, "get_peers", a);
+        benc_t *q = krpc_build_query(st, tx, "get_peers", a);
         if (!q) continue;
 
         uint8_t tok[4];
         memset(tok, 0, sizeof(tok));
         benc_t *resp = NULL;
-        if (krpc_query_one(g_dht, &nodes[i], q, &resp) == 0 && resp) {
+        if (krpc_query_one(st, &nodes[i], q, &resp) == 0 && resp) {
             benc_t *r = benc_dict_get(resp, "r");
             if (r && r->t == BENC_DICT) {
                 benc_t *tkn = benc_dict_get(r, "token");
                 if (tkn && tkn->t == BENC_STR && tkn->slen == 4) memcpy(tok, tkn->s, 4);
                 benc_t *nds = benc_dict_get(r, "nodes");
-                if (nds && nds->t == BENC_STR && nds->slen >= 26) parse_nodes_into_state(g_dht, nds->s, nds->slen);
+                if (nds && nds->t == BENC_STR && nds->slen >= 26) parse_nodes_into_state(st, nds->s, nds->slen);
             }
             benc_free(resp);
         }
@@ -748,70 +819,134 @@ int pcomm_dht_announce(const uint8_t infohash20[20], uint16_t port) {
         benc_dict_set(a2, "info_hash", benc_new_str(infohash20, 20));
         benc_dict_set(a2, "port", benc_new_int(port));
         benc_dict_set(a2, "token", benc_new_str(tok, 4));
-        benc_t *q2 = krpc_build_query(g_dht, tx2, "announce_peer", a2);
+        benc_t *q2 = krpc_build_query(st, tx2, "announce_peer", a2);
         if (!q2) continue;
         benc_t *resp2 = NULL;
-        (void)krpc_query_one(g_dht, &nodes[i], q2, &resp2);
+        (void)krpc_query_one(st, &nodes[i], q2, &resp2);
         benc_free(resp2);
         benc_free(q2);
     }
 
-    return 0;
+    int rc = dht_running(st) ? 0 : -1;
+    dht_release(st);
+    return rc;
+}
+
+static void dht_free_state(dht_state_t *st) {
+    if (st->udp_fd >= 0) close(st->udp_fd);
+    peer_item_t *peer = st->peers_head;
+    while (peer) {
+        peer_item_t *next = peer->next;
+        free(peer->peers);
+        free(peer);
+        peer = next;
+    }
+    for (size_t i = 0; i < st->pending_initialized; i++) {
+        benc_free(st->pending[i].resp);
+        pthread_cond_destroy(&st->pending[i].cv);
+    }
+    pthread_cond_destroy(&st->users_done);
+    pthread_mutex_destroy(&st->mu);
+    free(st);
 }
 
 int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db) {
-    if (!cfg || !me || !db) return -1;
-    if (g_dht) return 0;
+    if (!cfg || !me || !db || !db->db || pcomm_shutdown_requested()) return -1;
+    pthread_mutex_lock(&g_dht_mu);
+    if (g_dht) {
+        int rc = dht_running(g_dht) ? 0 : -1;
+        pthread_mutex_unlock(&g_dht_mu);
+        return rc;
+    }
 
     dht_state_t *st = (dht_state_t*)calloc(1, sizeof(dht_state_t));
-    if (!st) return -1;
-    pthread_mutex_init(&st->mu, NULL);
+    if (!st) {
+        pthread_mutex_unlock(&g_dht_mu);
+        return -1;
+    }
+    st->udp_fd = -1;
+    if (pthread_mutex_init(&st->mu, NULL) != 0) {
+        free(st);
+        pthread_mutex_unlock(&g_dht_mu);
+        return -1;
+    }
+    if (pthread_cond_init(&st->users_done, NULL) != 0) {
+        pthread_mutex_destroy(&st->mu);
+        free(st);
+        pthread_mutex_unlock(&g_dht_mu);
+        return -1;
+    }
+    for (size_t i = 0; i < DHT_MAX_QUERIES; i++) {
+        if (pthread_cond_init(&st->pending[i].cv, NULL) != 0) goto fail;
+        st->pending_initialized++;
+    }
     st->db = db;
     st->listen_port = cfg->relay_port;
     st->running = 1;
-    st->maint_interval_sec = (cfg->dht_maint_interval_sec > 3) ? (int)cfg->dht_maint_interval_sec : 10;
+    st->maint_interval_sec = cfg->dht_maint_interval_sec > 3 ? cfg->dht_maint_interval_sec : 10;
     st->allow_private_addrs = cfg->allow_private_addrs ? 1 : 0;
 
     compute_node_id(me, st->node_id);
-    (void)pcomm_random(st->secret, sizeof(st->secret));
+    if (pcomm_random(st->secret, sizeof(st->secret)) != 0) goto fail;
 
     st->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (st->udp_fd < 0) {
-        free(st);
-        return -1;
-    }
+    if (st->udp_fd < 0) goto fail;
 
     int yes = 1;
     setsockopt(st->udp_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    struct timeval timeout = {0, 200000};
+    if (setsockopt(st->udp_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        setsockopt(st->udp_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) goto fail;
 
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     a.sin_port = htons(cfg->relay_port);
-    if (bind(st->udp_fd, (struct sockaddr*)&a, sizeof(a)) != 0) {
-        close(st->udp_fd);
-        free(st);
-        return -1;
-    }
+    if (bind(st->udp_fd, (struct sockaddr*)&a, sizeof(a)) != 0) goto fail;
 
     load_bootstrap_from_contacts(st);
     load_bootstrap_from_db_nodes(st);
 
-    if (pthread_create(&st->rx_th, NULL, dht_rx_thread, st) != 0) {
-        close(st->udp_fd);
-        free(st);
-        return -1;
-    }
-    pthread_detach(st->rx_th);
+    if (pthread_create(&st->rx_th, NULL, dht_rx_thread, st) != 0) goto fail;
+    st->rx_started = 1;
 
-    if (pthread_create(&st->maint_th, NULL, dht_maint_thread, st) != 0) {
-        fprintf(stderr, "[dht] maint thread failed\n");
-    } else {
-        pthread_detach(st->maint_th);
-    }
+    if (pthread_create(&st->maint_th, NULL, dht_maint_thread, st) != 0) goto fail;
+    st->maint_started = 1;
 
     g_dht = st;
-    fprintf(stderr, "[dht] started on UDP %u (maint %ds)\n", (unsigned)cfg->relay_port, st->maint_interval_sec);
+    fprintf(stderr, "[dht] started on UDP %u (maint %us)\n", (unsigned)cfg->relay_port, (unsigned)st->maint_interval_sec);
+    pthread_mutex_unlock(&g_dht_mu);
     return 0;
+
+fail:
+    dht_request_stop_state(st);
+    if (st->rx_started) pthread_join(st->rx_th, NULL);
+    if (st->maint_started) pthread_join(st->maint_th, NULL);
+    dht_free_state(st);
+    pthread_mutex_unlock(&g_dht_mu);
+    return -1;
+}
+
+void pcomm_dht_request_stop(void) {
+    pthread_mutex_lock(&g_dht_mu);
+    if (g_dht) dht_request_stop_state(g_dht);
+    pthread_mutex_unlock(&g_dht_mu);
+}
+
+void pcomm_dht_stop(void) {
+    pthread_mutex_lock(&g_dht_mu);
+    dht_state_t *st = g_dht;
+    if (st) {
+        dht_request_stop_state(st);
+        if (st->rx_started) pthread_join(st->rx_th, NULL);
+        if (st->maint_started) pthread_join(st->maint_th, NULL);
+        pthread_mutex_lock(&st->mu);
+        while (st->active_calls > 0) pthread_cond_wait(&st->users_done, &st->mu);
+        pthread_mutex_unlock(&st->mu);
+        dht_flush_nodes_to_db(st);
+        g_dht = NULL;
+        dht_free_state(st);
+    }
+    pthread_mutex_unlock(&g_dht_mu);
 }

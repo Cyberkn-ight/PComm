@@ -16,6 +16,7 @@ PComm is a **prototype** as of rn, an onion-relay messenger written in pure C (t
 - End-to-end keepalive using `RELAY_PING/RELAY_PONG` (plus idle timeouts for dedicated circuits)
 - Hidden-service registry caps + TTL pruning on relays (intro + rendezvous cookies)
 - Relay upstream queue cap (prevents unbounded memory growth)
+- Mailbox deposit rate limits, storage quotas, and expiry
 - Exit policy safety default: relays reject connecting to private/loopback/link-local destinations unless enabled
 - DHT node persistence + maintenance (learned nodes are stored in SQLite and periodically refreshed)
 - Jittered mesh gossip interval (reduces fingerprintable periodicity)
@@ -69,19 +70,59 @@ networking headers and socket APIs. Keep each platform/toolchain's build directo
 separate. Generated build files are ignored by Git, along with local identities,
 message databases, and `peers.txt`; share the example peer file instead.
 
-### Replay protection tests
+To build the complete application on Windows using the MSYS POSIX runtime, install
+`gcc openssl-devel libsqlite-devel` with `pacman -S --needed` in an MSYS2 shell.
+Then use a separate PowerShell session (adjust the installation path if needed):
 
-The receive path has focused regression tests using real OpenSSL encryption and
-an in-memory SQLite database:
-
-```bash
-cmake -S . -B build-tests -G Ninja -DBUILD_TESTING=ON
-cmake --build build-tests --target test_replay_cache test_receive
-ctest --test-dir build-tests --output-on-failure
+```powershell
+$msysRoot = 'C:\msys64'
+$env:Path = "$msysRoot\usr\bin;$msysRoot\ucrt64\bin;$env:Path"
+cmake -S . -B build-posix-msys -G Ninja -DCMAKE_SYSTEM_NAME=MSYS `
+  "-DCMAKE_C_COMPILER=$msysRoot/usr/bin/gcc.exe" -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-posix-msys --target check
 ```
 
-These test targets also build with the Windows toolchain above, independently of
-the application's remaining POSIX networking dependencies.
+This changes PATH only for that session. The resulting application depends on the
+MSYS runtime; it does not resolve the remaining native Windows networking port.
+
+### Tests
+
+Build and run the unit and regression tests with one target:
+
+```bash
+cmake -S . -B build-tests -G Ninja -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-tests --target check
+```
+
+`check` builds every test executable before running CTest and reports a failing
+exit status if any test fails. Use a separate build directory and
+`-DCMAKE_BUILD_TYPE=Release` to test an optimized build; checks remain active with
+`NDEBUG`. For a multi-configuration generator, select `--config Debug` or
+`--config Release` on the build command. Individual tests can also be rerun with
+`ctest --test-dir build-tests --output-on-failure`.
+
+| CTest suite | Coverage |
+| --- | --- |
+| `crypto` | RFC known-answer vectors, seal/open round trips, authentication failures, and buffer limits. |
+| `msg` | Direct/group/legacy messages, independent wire fixtures, UTF-8, field limits, and truncation. |
+| `db` | Contact/message/group/settings/descriptor/DHT-node insert, fetch, and update operations. |
+| `bencode` | Golden encodings, nested containers, binary strings/keys, integer boundaries, and malformed data. |
+| `replay_cache`, `receive_replay` | Replay windows, concurrent delivery, storage failure retries, and equivalent X25519 header encodings. |
+| `mailbox_guard`, `mailbox_db` | Rate and storage limits, expiry, concurrent admission, and safe retrieval batches. |
+| `proto_limits` | Packet framing, early length rejection, and bounded fragment accumulation. |
+| `lifecycle` | Concurrent shutdown wakeups, repeated requests, timeouts, and restart reset. |
+| `net_shutdown` (POSIX) | Interrupting accept/read operations, socket ownership, and cleanup. |
+| `services_shutdown` (POSIX) | Service restarts, stalled clients and peers, active circuits/rendezvous, and partial startup rollback. |
+| `process_shutdown` (POSIX) | Actual SIGINT/SIGTERM exits, startup failure, database integrity, and port reuse. |
+
+The ten portable suites use real OpenSSL and isolated in-memory SQLite databases;
+packet I/O in the framing test is simulated. They build with the native Windows
+toolchain independently of the application's POSIX networking dependencies.
+POSIX builds add three integration suites using loopback peers. Process tests
+create temporary identities and SQLite files inside the build directory and
+remove their fixtures afterward; they do not use your data directory. No extra
+test framework is required. These checks do not replace full multi-node or
+cross-platform application testing.
 
 ## Run
 
@@ -98,6 +139,14 @@ the application's remaining POSIX networking dependencies.
 - On first start PComm generates `identity.key` in the data dir.
 - It prints your PComm ID.
 - Open UI: `http://127.0.0.1:8080/`
+
+SIGINT (Ctrl+C) and SIGTERM request coordinated shutdown. The signal handler only
+sets a flag; normal thread context interrupts socket operations and waits, joins
+all service and connection workers, then closes SQLite. The same cleanup runs
+after a partially failed startup. Service start/stop operations are serialized by
+the main controller, and shutdown reset is only valid after every worker joins.
+An operating-system hostname lookup already inside synchronous `getaddrinfo` can
+still delay shutdown until the resolver returns.
 
 ### Dev / local network helpers
 
@@ -149,6 +198,40 @@ The cache stores no plaintext and expires entries 24 hours after acceptance, usi
 local monotonic time. It is process-local: restarting clears it, and LRU eviction
 can shorten the replay window. It does not authenticate sender identity or reject
 the same plaintext encrypted into a different envelope.
+
+### Mailbox abuse controls
+
+Each relay applies these limits to mailbox deposits:
+
+- Per accepted socket peer IP: burst of 32 deposits, replenished at one per second.
+- Across the relay: burst of 128 deposits, replenished at 20 per second.
+- Per mailbox: 100 envelopes and 64 KiB of stored envelope bytes.
+- Across mailboxes: 10,000 envelopes and 16 MiB of stored envelope bytes.
+- Envelope size: 1 to 3,072 bytes, including encryption and message headers.
+- Expiry: 48 hours after the relay receives an envelope. Expired items are pruned
+  on reads/writes and by five-second relay maintenance.
+
+The IP limiter survives reconnects and keeps up to 4,096 hashed source keys in
+memory. Fully replenished source entries are reused; a full limiter rejects new
+sources instead of resetting exhausted budgets. Source addresses are not stored
+in SQLite or logged by these controls. Onion-routed deposits share their exit
+relay's allowance. These limits also apply during local development.
+
+Malformed, rate-limited, and over-quota deposits are silently rejected and do not
+trigger DHT announcements. The existing deposit protocol has no acceptance ACK;
+successful socket transmission alone does not establish that a relay stored the
+message. Proof of work remains an optional future extension.
+
+Retrieval batches contain at most 3,800 encoded bytes so they fit the current
+single-cell RPC response. Only returned rows are removed; remaining rows stay
+queued for later polls. Larger pre-existing envelopes are left to expire. The
+mailbox sender rejects new envelopes over 3 KiB before constructing a deposit.
+This size limit includes group invites and their member lists, so large invites
+can exceed it before the UI's 64-member input limit. The current group UI does
+not surface every individual delivery failure.
+Packet payloads and circuit request/response buffers are separately bounded to
+64 KiB plus framing. These are mailbox admission and storage protections;
+connection-flood and slow-client defenses require further work.
 
 ## Group chats (prototype)
 

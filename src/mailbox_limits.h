@@ -1,0 +1,23 @@
+#ifndef PCOMM_MAILBOX_LIMITS_H
+#define PCOMM_MAILBOX_LIMITS_H
+
+#include <stdint.h>
+
+/* Keep each envelope and response batch within the current single-cell RPC
+ * transport (4096 bytes, including up to three 28-byte onion layers).
+ */
+#define PCOMM_MAILBOX_MAX_BLOB_LEN 3072u
+#define PCOMM_MAILBOX_RESPONSE_MAX_BYTES 3800u
+#define PCOMM_MAILBOX_MAX_ITEMS 100u
+#define PCOMM_MAILBOX_MAX_BYTES 65536u
+#define PCOMM_MAILBOX_GLOBAL_MAX_ITEMS 10000u
+#define PCOMM_MAILBOX_GLOBAL_MAX_BYTES (16u * 1024u * 1024u)
+#define PCOMM_MAILBOX_TTL_SEC INT64_C(172800)
+
+#define PCOMM_MAILBOX_IP_CAPACITY 4096u
+#define PCOMM_MAILBOX_IP_BURST 32u
+#define PCOMM_MAILBOX_IP_INTERVAL_MS UINT64_C(1000)
+#define PCOMM_MAILBOX_GLOBAL_BURST 128u
+#define PCOMM_MAILBOX_GLOBAL_INTERVAL_MS UINT64_C(50)
+
+#endif

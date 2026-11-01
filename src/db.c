@@ -1,4 +1,5 @@
 #include "db.h"
+#include "mailbox_limits.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -41,7 +42,7 @@ int pcomm_db_open(pcomm_db_t *pdb, const char *data_dir) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/pcomm.sqlite", data_dir);
 
-    if (sqlite3_open_v2(path, &pdb->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK) {
+    if (sqlite3_open_v2(path, &pdb->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         fprintf(stderr, "Failed to open sqlite db: %s\n", sqlite3_errmsg(pdb->db));
         return -1;
     }
@@ -122,6 +123,7 @@ int pcomm_db_init_schema(pcomm_db_t *pdb) {
         " blob BLOB NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_mailbox_key_id ON mailbox_items(mkey, id);"
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_received ON mailbox_items(ts_unix);"
         "CREATE TABLE IF NOT EXISTS descriptors("
         " dkey BLOB PRIMARY KEY,"
         " ts_unix INTEGER NOT NULL,"
@@ -415,88 +417,144 @@ int pcomm_db_list_group_participants(pcomm_db_t *pdb, int64_t conv_id, char ***i
     return 0;
 }
 
-int pcomm_db_mailbox_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *blob, uint32_t blob_len, int64_t ts_unix) {
-    if (!pdb || !pdb->db || !key || !blob) return -1;
-    const char *sql = "INSERT INTO mailbox_items(mkey,ts_unix,blob) VALUES(?,?,?);";
+static int mailbox_prune_locked(sqlite3 *db, int64_t now_unix) {
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_blob(st, 1, key, 32, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, ts_unix);
-    sqlite3_bind_blob(st, 3, blob, (int)blob_len, SQLITE_TRANSIENT);
+    if (sqlite3_prepare_v2(db, "DELETE FROM mailbox_items WHERE ts_unix<=?;", -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_int64(st, 1, now_unix - PCOMM_MAILBOX_TTL_SEC);
     int rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    return (rc == SQLITE_DONE) ? 0 : -1;
+    return rc == SQLITE_DONE ? 0 : -1;
 }
 
-int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], uint8_t **out, uint32_t *out_len) {
-    if (!pdb || !pdb->db || !key || !out || !out_len) return -1;
-    *out = NULL; *out_len = 0;
+int pcomm_db_mailbox_prune(pcomm_db_t *pdb, int64_t now_unix) {
+    if (!pdb || !pdb->db || now_unix < 0) return -1;
+    sqlite3_mutex *mutex = sqlite3_db_mutex(pdb->db);
+    sqlite3_mutex_enter(mutex);
+    int rc = mailbox_prune_locked(pdb->db, now_unix);
+    sqlite3_mutex_leave(mutex);
+    return rc;
+}
 
-    exec_sql(pdb->db, "BEGIN;");
+int pcomm_db_mailbox_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *blob,
+                         uint32_t blob_len, int64_t received_unix) {
+    if (!pdb || !pdb->db || !key || !blob || blob_len == 0 ||
+        blob_len > PCOMM_MAILBOX_MAX_BLOB_LEN || received_unix < 0) return -1;
 
-    const char *sel = "SELECT id, ts_unix, blob FROM mailbox_items WHERE mkey=? ORDER BY id ASC LIMIT 100;";
+    /* Quota checks and insertion are one SQLite statement, so concurrent writers
+     * cannot both observe a free slot and exceed a row or byte limit.
+     */
+    const char *sql =
+        "INSERT INTO mailbox_items(mkey,ts_unix,blob) SELECT ?1,?2,?3 WHERE "
+        "(SELECT count(*) FROM mailbox_items WHERE mkey=?1)<?4 AND "
+        "(SELECT coalesce(sum(length(blob)),0) FROM mailbox_items WHERE mkey=?1)<=?5-length(?3) AND "
+        "(SELECT count(*) FROM mailbox_items)<?6 AND "
+        "(SELECT coalesce(sum(length(blob)),0) FROM mailbox_items)<=?7-length(?3);";
+    sqlite3_mutex *mutex = sqlite3_db_mutex(pdb->db);
+    sqlite3_mutex_enter(mutex);
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(pdb->db, sel, -1, &st, NULL) != SQLITE_OK) {
-        exec_sql(pdb->db, "ROLLBACK;");
-        return -1;
-    }
+    int result = -1;
+    if (mailbox_prune_locked(pdb->db, received_unix) != 0) goto done;
+    if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK) goto done;
     sqlite3_bind_blob(st, 1, key, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, received_unix);
+    sqlite3_bind_blob(st, 3, blob, (int)blob_len, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, PCOMM_MAILBOX_MAX_ITEMS);
+    sqlite3_bind_int64(st, 5, PCOMM_MAILBOX_MAX_BYTES);
+    sqlite3_bind_int64(st, 6, PCOMM_MAILBOX_GLOBAL_MAX_ITEMS);
+    sqlite3_bind_int64(st, 7, PCOMM_MAILBOX_GLOBAL_MAX_BYTES);
+    if (sqlite3_step(st) == SQLITE_DONE) result = sqlite3_changes(pdb->db) == 1 ? 0 : 1;
+done:
+    sqlite3_finalize(st);
+    sqlite3_mutex_leave(mutex);
+    return result;
+}
 
-    int count = 0;
-    uint64_t ids[100];
-    int64_t tss[100];
-    const void *blobs[100];
-    int blens[100];
-    while (sqlite3_step(st) == SQLITE_ROW && count < 100) {
-        ids[count] = (uint64_t)sqlite3_column_int64(st, 0);
-        tss[count] = sqlite3_column_int64(st, 1);
-        blobs[count] = sqlite3_column_blob(st, 2);
-        blens[count] = sqlite3_column_bytes(st, 2);
-        if (!blobs[count] || blens[count] <= 0) continue;
+int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], int64_t now_unix,
+                                    uint8_t **out, uint32_t *out_len) {
+    if (!out || !out_len) return -1;
+    *out = NULL;
+    *out_len = 0;
+    if (!pdb || !pdb->db || !key || now_unix < 0) return -1;
+
+    uint8_t *buf = (uint8_t *)malloc(PCOMM_MAILBOX_RESPONSE_MAX_BYTES);
+    if (!buf) return -1;
+    sqlite3_mutex *mutex = sqlite3_db_mutex(pdb->db);
+    sqlite3_mutex_enter(mutex);
+    sqlite3_stmt *st = NULL;
+    int result = -1;
+    int savepoint = 0;
+    uint32_t off = 2;
+    uint16_t count = 0;
+    sqlite3_int64 ids[PCOMM_MAILBOX_MAX_ITEMS];
+
+    /* SAVEPOINT also works if the caller already has a transaction. It cannot
+     * commit an unrelated outer transaction on this shared connection.
+     */
+    if (sqlite3_exec(pdb->db, "SAVEPOINT pcomm_mailbox_read;", NULL, NULL, NULL) != SQLITE_OK) goto done;
+    savepoint = 1;
+    if (mailbox_prune_locked(pdb->db, now_unix) != 0) goto done;
+    const char *sel =
+        "SELECT id,ts_unix,blob FROM mailbox_items WHERE mkey=?1 "
+        "AND length(blob) BETWEEN 1 AND ?2 ORDER BY id ASC LIMIT ?3;";
+    if (sqlite3_prepare_v2(pdb->db, sel, -1, &st, NULL) != SQLITE_OK) goto done;
+    sqlite3_bind_blob(st, 1, key, 32, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, PCOMM_MAILBOX_MAX_BLOB_LEN);
+    sqlite3_bind_int64(st, 3, PCOMM_MAILBOX_MAX_ITEMS);
+    int step_rc;
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        int blen = sqlite3_column_bytes(st, 2);
+        const void *blob = sqlite3_column_blob(st, 2);
+        if (!blob || blen <= 0 || blen > (int)PCOMM_MAILBOX_MAX_BLOB_LEN) goto done;
+        if ((uint32_t)blen + 16u > PCOMM_MAILBOX_RESPONSE_MAX_BYTES - off) break;
+        ids[count] = sqlite3_column_int64(st, 0);
+        uint64_t idn = to_be64((uint64_t)ids[count]);
+        uint32_t tsn = htonl((uint32_t)sqlite3_column_int64(st, 1));
+        uint32_t ln = htonl((uint32_t)blen);
+        memcpy(buf + off, &idn, 8); off += 8;
+        memcpy(buf + off, &tsn, 4); off += 4;
+        memcpy(buf + off, &ln, 4); off += 4;
+        /* SQLite's blob pointer expires on the next step/finalize. */
+        memcpy(buf + off, blob, (size_t)blen); off += (uint32_t)blen;
         count++;
     }
+    if (step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) goto done;
     sqlite3_finalize(st);
+    st = NULL;
 
-    uint32_t total = 2;
-    for (int i = 0; i < count; i++) {
-        total += 8 + 4 + 4 + (uint32_t)blens[i];
-    }
-
-    uint8_t *buf = (uint8_t*)malloc(total);
-    if (!buf) {
-        exec_sql(pdb->db, "ROLLBACK;");
-        return -1;
-    }
-    uint16_t ncount = (uint16_t)count;
-    uint16_t n = htons(ncount);
-    memcpy(buf, &n, 2);
-    uint32_t off = 2;
-    for (int i = 0; i < count; i++) {
-        uint64_t idn = to_be64(ids[i]);
-        memcpy(buf + off, &idn, 8); off += 8;
-        uint32_t tsn = htonl((uint32_t)tss[i]);
-        memcpy(buf + off, &tsn, 4); off += 4;
-        uint32_t ln = htonl((uint32_t)blens[i]);
-        memcpy(buf + off, &ln, 4); off += 4;
-        memcpy(buf + off, blobs[i], (size_t)blens[i]); off += (uint32_t)blens[i];
-    }
-
-    if (count > 0) {
-        uint64_t max_id = ids[count-1];
-        sqlite3_stmt *del = NULL;
-        if (sqlite3_prepare_v2(pdb->db, "DELETE FROM mailbox_items WHERE mkey=? AND id<=?;", -1, &del, NULL) == SQLITE_OK) {
-            sqlite3_bind_blob(del, 1, key, 32, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(del, 2, (sqlite3_int64)max_id);
-            sqlite3_step(del);
+    if (count != 0) {
+        char sql[128 + 3 * PCOMM_MAILBOX_MAX_ITEMS];
+        size_t used = (size_t)snprintf(sql, sizeof(sql), "DELETE FROM mailbox_items WHERE mkey=? AND id IN (");
+        for (uint16_t i = 0; i < count; i++) {
+            int n = snprintf(sql + used, sizeof(sql) - used, "%s?", i ? "," : "");
+            if (n < 0 || (size_t)n >= sizeof(sql) - used) goto done;
+            used += (size_t)n;
         }
-        sqlite3_finalize(del);
+        if (used + 3 > sizeof(sql)) goto done;
+        memcpy(sql + used, ");", 3);
+        if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK) goto done;
+        sqlite3_bind_blob(st, 1, key, 32, SQLITE_TRANSIENT);
+        for (uint16_t i = 0; i < count; i++) sqlite3_bind_int64(st, i + 2, ids[i]);
+        if (sqlite3_step(st) != SQLITE_DONE) goto done;
+        sqlite3_finalize(st);
+        st = NULL;
     }
-
-    exec_sql(pdb->db, "COMMIT;");
-
+    if (sqlite3_exec(pdb->db, "RELEASE pcomm_mailbox_read;", NULL, NULL, NULL) != SQLITE_OK) goto done;
+    savepoint = 0;
+    uint16_t ncount = htons(count);
+    memcpy(buf, &ncount, 2);
     *out = buf;
-    *out_len = total;
-    return 0;
+    *out_len = off;
+    buf = NULL;
+    result = 0;
+done:
+    sqlite3_finalize(st);
+    if (savepoint) {
+        sqlite3_exec(pdb->db, "ROLLBACK TO pcomm_mailbox_read;", NULL, NULL, NULL);
+        sqlite3_exec(pdb->db, "RELEASE pcomm_mailbox_read;", NULL, NULL, NULL);
+    }
+    sqlite3_mutex_leave(mutex);
+    free(buf);
+    return result;
 }
 
 int pcomm_db_desc_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *blob, uint32_t blob_len, int64_t expires_unix, int64_t ts_unix) {

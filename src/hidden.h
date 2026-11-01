@@ -5,6 +5,8 @@
 #include "db.h"
 
 int pcomm_hidden_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db);
+void pcomm_hidden_request_stop(void);
+void pcomm_hidden_stop(void);
 
 int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
                               const char *recipient_id,

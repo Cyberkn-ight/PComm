@@ -8,21 +8,26 @@
 #include "hidden.h"
 #include "dht.h"
 #include "circuit.h"
+#include "lifecycle.h"
+#include "net.h"
 
 #include <stdio.h>
 #include <signal.h>
-#include <unistd.h>
 #include <string.h>
 
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_signal = 0;
 static void on_sig(int s) {
-    (void)s;
-    g_running = 0;
+    /* Mutexes, socket operations, and joins belong to normal thread context. */
+    g_signal = s;
 }
 
 int main(int argc, char **argv) {
+    pcomm_shutdown_reset();
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
+#ifdef SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     pcomm_config_t cfg;
     if (pcomm_config_from_argv(&cfg, argc, argv) != 0) return 1;
@@ -33,14 +38,16 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    pcomm_db_t db;
+    pcomm_db_t db = {0};
     if (pcomm_db_open(&db, cfg.data_dir) != 0) {
         fprintf(stderr, "Failed to open database\n");
+        pcomm_db_close(&db);
         return 1;
     }
+    int result = 1;
     if (pcomm_db_init_schema(&db) != 0) {
         fprintf(stderr, "Failed to init schema\n");
-        return 1;
+        goto shutdown;
     }
 
     int loaded = pcomm_load_peers_file(&db, cfg.peers_path);
@@ -51,26 +58,46 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Your PComm ID: %s\n", me.user_id);
     fprintf(stderr, "Data dir: %s\n", cfg.data_dir);
 
-    if (pcomm_relay_start(&cfg, &me, &db) != 0) {
-        fprintf(stderr, "Failed to start relay\n");
-        return 1;
+    const struct {
+        const char *name;
+        int (*start)(const pcomm_config_t *, const pcomm_identity_t *, pcomm_db_t *);
+    } services[] = {
+        {"relay", pcomm_relay_start},
+        {"HTTP server", pcomm_http_start},
+        {"mesh", pcomm_mesh_start},
+        {"DHT", pcomm_dht_start},
+        {"circuits", pcomm_circuits_start},
+        {"hidden services", pcomm_hidden_start},
+    };
+    for (size_t i = 0; i < sizeof(services) / sizeof(services[0]); i++) {
+        if (g_signal || pcomm_shutdown_requested()) { result = 0; goto shutdown; }
+        if (services[i].start(&cfg, &me, &db) != 0) {
+            fprintf(stderr, "Failed to start %s\n", services[i].name);
+            goto shutdown;
+        }
     }
 
-    if (pcomm_http_start(&cfg, &me, &db) != 0) {
-        fprintf(stderr, "Failed to start HTTP server\n");
-        return 1;
+    result = 0;
+    while (!g_signal && !pcomm_shutdown_requested()) {
+        if (pcomm_shutdown_wait(100) < 0) { result = 1; break; }
     }
 
-    pcomm_mesh_start(&cfg, &me, &db);
-    pcomm_dht_start(&cfg, &me, &db);
-    pcomm_circuits_start(&cfg, &me, &db);
-    pcomm_hidden_start(&cfg, &me, &db);
-
-    while (g_running) {
-        sleep(1);
-    }
-
+shutdown:
+    /* Wake every provider before joining consumers, then release SQLite only
+     * after no worker or callback can touch it (including partial startup).
+     */
+    pcomm_shutdown_request();
+    net_shutdown_all();
+    pcomm_dht_request_stop();
+    pcomm_hidden_request_stop();
+    pcomm_circuits_request_stop();
+    pcomm_http_stop();
+    pcomm_mesh_stop();
+    pcomm_hidden_stop();
+    pcomm_circuits_stop();
+    pcomm_relay_stop();
+    pcomm_dht_stop();
     pcomm_db_close(&db);
     fprintf(stderr, "Bye\n");
-    return 0;
+    return result;
 }
