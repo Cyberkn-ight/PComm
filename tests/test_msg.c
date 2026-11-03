@@ -145,7 +145,7 @@ static int test_empty_invite_and_group_text(void) {
     CHECK(decoded.kind == PCOMM_PLAIN_GROUP_INVITE && decoded.timestamp == 0);
     CHECK(strcmp(decoded.sender, "s") == 0 && strcmp(decoded.group, "g") == 0);
     CHECK(decoded.title != NULL && decoded.title[0] == '\0' && decoded.member_count == 0);
-    /* An empty result may be NULL or an allocated empty array; both are freed. */
+
     CHECK(decoded.text == NULL);
     decoded_free(&decoded);
     free(wire);
@@ -272,7 +272,7 @@ static int test_unknown_types_and_bogus_lengths(void) {
     wire = NULL;
 
     CHECK(pcomm_msg_pack_group_invite(1, "s", "g", "t", members, 1, &wire, &wire_len) == 0);
-    /* sender at 8; UUID length at 9; title length at 11; member count at 14. */
+
     wire[9] = 0xff;
     CHECK(rejected(wire, wire_len));
     wire[9] = 1;

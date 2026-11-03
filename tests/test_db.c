@@ -161,12 +161,94 @@ static int test_settings_and_descriptors(void) {
     CHECK(blob_len == sizeof(replacement) && memcmp(blob, replacement, sizeof(replacement)) == 0);
     free(blob);
     blob = NULL;
+    CHECK(pcomm_db_desc_put(&db, key, first, sizeof(first), 0, 19) == 1);
+    CHECK(pcomm_db_desc_get(&db, key, &blob, &blob_len) == 0);
+    CHECK(blob_len == sizeof(replacement) && memcmp(blob, replacement, sizeof(replacement)) == 0);
+    free(blob);
+    blob = NULL;
+    CHECK(pcomm_db_desc_put(&db, key, first, sizeof(first), 0, 20) == 1);
+    CHECK(pcomm_db_desc_get(&db, key, &blob, &blob_len) == 0);
+    CHECK(blob_len == sizeof(replacement) && memcmp(blob, replacement, sizeof(replacement)) == 0);
+    free(blob);
+    blob = NULL;
+    CHECK(pcomm_db_desc_put(&db, key, replacement, sizeof(replacement), INT64_MAX, 20) == 0);
+    CHECK(pcomm_db_desc_get(&db, key, &blob, &blob_len) == 0);
+    CHECK(blob_len == sizeof(replacement) && memcmp(blob, replacement, sizeof(replacement)) == 0);
+    free(blob);
+    blob = NULL;
+    CHECK(count_rows(&db, "SELECT count(*) FROM descriptors WHERE ts_unix=20 AND expires_unix=9223372036854775807;") == 1);
     CHECK(count_rows(&db, "SELECT count(*) FROM descriptors;") == 1);
     CHECK(pcomm_db_desc_get(&db, missing_key, &blob, &blob_len) == -1);
     CHECK(pcomm_db_desc_put(&db, key, first, sizeof(first), 0, 30) == 0);
     CHECK(pcomm_db_desc_get(&db, key, &blob, &blob_len) == -1);
 done:
     free(blob);
+    pcomm_db_close(&db);
+    return ok;
+}
+
+static int read_descriptor_trust(pcomm_db_t *db, const uint8_t owner[32], uint32_t epoch,
+                                    uint32_t *issued, uint8_t digest[32]) {
+    sqlite3_stmt *statement = NULL;
+    int result = -1;
+    if (sqlite3_prepare_v2(db->db, "SELECT issued,digest FROM descriptor_trust WHERE owner=? AND epoch=?;",
+            -1, &statement, NULL) == SQLITE_OK &&
+        sqlite3_bind_blob(statement, 1, owner, 32, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_int64(statement, 2, epoch) == SQLITE_OK && sqlite3_step(statement) == SQLITE_ROW &&
+        sqlite3_column_bytes(statement, 1) == 32) {
+        *issued = (uint32_t)sqlite3_column_int64(statement, 0);
+        memcpy(digest, sqlite3_column_blob(statement, 1), 32);
+        result = 0;
+    }
+    sqlite3_finalize(statement);
+    return result;
+}
+
+static int test_descriptor_trust_monotonicity(void) {
+    pcomm_db_t db = {0};
+    uint8_t owner[32] = {1}, other_owner[32] = {2};
+    uint8_t first_digest[32] = {3}, second_digest[32] = {4}, fetched_digest[32];
+    uint32_t issued = 0;
+    int ok = 1;
+    CHECK(open_memory_db(&db) == 0);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 10, 100, first_digest) == 0);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 10, 100, first_digest) == 0);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 10, 99, second_digest) == 1);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 10, 100, second_digest) == 1);
+    CHECK(read_descriptor_trust(&db, owner, 10, &issued, fetched_digest) == 0);
+    CHECK(issued == 100 && memcmp(fetched_digest, first_digest, 32) == 0);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 10, 101, second_digest) == 0);
+    CHECK(pcomm_db_descriptor_trust(&db, other_owner, 10, 1, first_digest) == 0);
+    CHECK(read_descriptor_trust(&db, owner, 10, &issued, fetched_digest) == 0);
+    CHECK(issued == 101 && memcmp(fetched_digest, second_digest, 32) == 0);
+    CHECK(read_descriptor_trust(&db, other_owner, 10, &issued, fetched_digest) == 0);
+    CHECK(issued == 1 && memcmp(fetched_digest, first_digest, 32) == 0);
+
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 11, 200, first_digest) == 0);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 12, 300, first_digest) == 0);
+    CHECK(read_descriptor_trust(&db, owner, 10, &issued, fetched_digest) == -1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM descriptor_trust;") == 3);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 10, 500, second_digest) == 1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM descriptor_trust;") == 3);
+    CHECK(read_descriptor_trust(&db, owner, 10, &issued, fetched_digest) == -1);
+
+    CHECK(sqlite3_exec(db.db,
+        "CREATE TEMP TRIGGER reject_trust_prune BEFORE DELETE ON descriptor_trust "
+        "WHEN OLD.epoch=11 BEGIN SELECT RAISE(ABORT,'injected trust prune failure'); END;",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 13, 400, second_digest) == -1);
+    CHECK(sqlite3_get_autocommit(db.db) != 0);
+    CHECK(read_descriptor_trust(&db, owner, 13, &issued, fetched_digest) == -1);
+    CHECK(read_descriptor_trust(&db, owner, 11, &issued, fetched_digest) == 0);
+    CHECK(count_rows(&db, "SELECT count(*) FROM descriptor_trust;") == 3);
+    CHECK(sqlite3_exec(db.db, "DROP TRIGGER reject_trust_prune;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(pcomm_db_descriptor_trust(&db, owner, 13, 400, second_digest) == 0);
+    CHECK(read_descriptor_trust(&db, owner, 11, &issued, fetched_digest) == -1);
+    CHECK(read_descriptor_trust(&db, owner, 13, &issued, fetched_digest) == 0);
+    CHECK(issued == 400 && memcmp(fetched_digest, second_digest, 32) == 0);
+    CHECK(count_rows(&db, "SELECT count(*) FROM descriptor_trust;") == 3);
+    CHECK(sqlite3_next_stmt(db.db, NULL) == NULL);
+done:
     pcomm_db_close(&db);
     return ok;
 }
@@ -197,13 +279,138 @@ done:
     return ok;
 }
 
+static int test_conversation_helpers_preserve_outer_transaction(void) {
+    pcomm_db_t db = {0};
+    int ok = 1;
+    CHECK(open_memory_db(&db) == 0);
+    CHECK(pcomm_db_get_or_create_direct_conv(&db, "existing-peer") > 0);
+    CHECK(sqlite3_exec(db.db,
+        "BEGIN; INSERT INTO settings(key,value) VALUES('outer','uncommitted');",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(pcomm_db_get_or_create_direct_conv(&db, "outer-peer") > 0);
+    CHECK(sqlite3_get_autocommit(db.db) == 0);
+    int64_t group = pcomm_db_get_or_create_group_conv(&db, "outer-group", "Uncommitted group");
+    CHECK(group > 0 && sqlite3_get_autocommit(db.db) == 0);
+    CHECK(pcomm_db_add_participant(&db, group, "outer-member") == 0);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 3);
+    CHECK(sqlite3_exec(db.db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(sqlite3_get_autocommit(db.db) != 0);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM participants;") == 1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM settings;") == 0);
+
+    CHECK(sqlite3_exec(db.db,
+        "CREATE TEMP TRIGGER reject_participant BEFORE INSERT ON participants "
+        "WHEN NEW.user_id='blocked-peer' BEGIN SELECT RAISE(ABORT,'injected participant failure'); END;"
+        "BEGIN; INSERT INTO settings(key,value) VALUES('outer','preserved');",
+        NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(pcomm_db_get_or_create_direct_conv(&db, "blocked-peer") == -1);
+    CHECK(sqlite3_get_autocommit(db.db) == 0);
+    CHECK(count_rows(&db, "SELECT count(*) FROM settings WHERE key='outer';") == 1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 1);
+    CHECK(pcomm_db_get_or_create_group_conv(&db, "after-failure", NULL) > 0);
+    CHECK(sqlite3_get_autocommit(db.db) == 0);
+    CHECK(sqlite3_exec(db.db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM settings;") == 0);
+done:
+    pcomm_db_close(&db);
+    return ok;
+}
+
+typedef struct {
+    pcomm_db_t *db;
+    const char *peer;
+    int result;
+    int called;
+} transaction_context_t;
+
+static int write_transaction(void *arg) {
+    transaction_context_t *context = (transaction_context_t *)arg;
+    const uint8_t cipher[] = {1, 2, 3};
+    char group_uuid[64];
+    context->called++;
+    snprintf(group_uuid, sizeof(group_uuid), "group:%s", context->peer);
+    int64_t direct = pcomm_db_get_or_create_direct_conv(context->db, context->peer);
+    int64_t group = pcomm_db_get_or_create_group_conv(context->db, group_uuid, "Transaction group");
+    if (direct < 0 || group < 0 ||
+        pcomm_db_add_participant(context->db, group, context->peer) != 0 ||
+        pcomm_db_kv_set(context->db, "transaction-marker", context->peer) != 0 ||
+        pcomm_db_insert_message(context->db, direct, 0, context->peer, context->peer,
+                                 "transaction message", cipher, sizeof(cipher), 123) != 0) return -1;
+    return context->result;
+}
+
+static int reject_commit(void *arg) {
+    (void)arg;
+    return 1;
+}
+
+static int test_checked_transaction_commit_and_rollback(void) {
+    pcomm_db_t db = {0};
+    transaction_context_t context = {&db, "committed-peer", 0, 0};
+    char marker[64];
+    int ok = 1;
+    CHECK(open_memory_db(&db) == 0);
+    CHECK(count_rows(&db, "PRAGMA secure_delete;") == 1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'ratchet_%';") == 5);
+    CHECK(count_rows(&db, "SELECT count(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_ratchet_%';") == 2);
+    CHECK(pcomm_db_transaction(&db, write_transaction, &context) == 0);
+    CHECK(sqlite3_get_autocommit(db.db) != 0 && context.called == 1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 2);
+    CHECK(count_rows(&db, "SELECT count(*) FROM participants;") == 2);
+    CHECK(count_rows(&db, "SELECT count(*) FROM messages;") == 1);
+
+    context.peer = "cancelled-peer";
+    context.result = -7;
+    CHECK(pcomm_db_transaction(&db, write_transaction, &context) == -7);
+    CHECK(sqlite3_get_autocommit(db.db) != 0 && context.called == 2);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 2);
+    CHECK(count_rows(&db, "SELECT count(*) FROM participants;") == 2);
+    CHECK(count_rows(&db, "SELECT count(*) FROM messages;") == 1);
+    CHECK(pcomm_db_kv_get(&db, "transaction-marker", marker, sizeof(marker)) == 0);
+    CHECK(strcmp(marker, "committed-peer") == 0);
+
+    context.result = 1;
+    CHECK(pcomm_db_transaction(&db, write_transaction, &context) == 1);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 2);
+    CHECK(sqlite3_exec(db.db, "BEGIN;", NULL, NULL, NULL) == SQLITE_OK);
+    int calls_before = context.called;
+    CHECK(pcomm_db_transaction(&db, write_transaction, &context) == -1);
+    CHECK(context.called == calls_before && sqlite3_get_autocommit(db.db) == 0);
+    CHECK(sqlite3_exec(db.db, "ROLLBACK;", NULL, NULL, NULL) == SQLITE_OK);
+
+    context.peer = "commit-failure-peer";
+    context.result = 0;
+    sqlite3_commit_hook(db.db, reject_commit, NULL);
+    CHECK(pcomm_db_transaction(&db, write_transaction, &context) == -1);
+    sqlite3_commit_hook(db.db, NULL, NULL);
+    CHECK(sqlite3_get_autocommit(db.db) != 0);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 2);
+    CHECK(count_rows(&db, "SELECT count(*) FROM participants;") == 2);
+    CHECK(count_rows(&db, "SELECT count(*) FROM messages;") == 1);
+    CHECK(pcomm_db_kv_get(&db, "transaction-marker", marker, sizeof(marker)) == 0);
+    CHECK(strcmp(marker, "committed-peer") == 0);
+    CHECK(pcomm_db_transaction(&db, write_transaction, &context) == 0);
+    CHECK(count_rows(&db, "SELECT count(*) FROM conversations;") == 4);
+    CHECK(count_rows(&db, "SELECT count(*) FROM messages;") == 2);
+    CHECK(sqlite3_next_stmt(db.db, NULL) == NULL);
+done:
+    if (db.db) sqlite3_commit_hook(db.db, NULL, NULL);
+    pcomm_db_close(&db);
+    return ok;
+}
+
 int main(void) {
     const struct { const char *name; int (*run)(void); } tests[] = {
         {"contact insert/fetch/update and schema idempotence", test_contact_insert_fetch_and_update},
         {"direct conversations and binary message storage", test_direct_conversation_and_message_storage},
         {"group participant storage and duplicate handling", test_group_membership_storage},
         {"settings and descriptor storage", test_settings_and_descriptors},
+        {"descriptor trust monotonicity and atomic pruning", test_descriptor_trust_monotonicity},
         {"DHT node insert/fetch/update", test_dht_node_insert_fetch_and_update},
+        {"conversation helpers preserve outer transactions", test_conversation_helpers_preserve_outer_transaction},
+        {"checked transaction commit and rollback", test_checked_transaction_commit_and_rollback},
     };
     size_t failures = 0;
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {

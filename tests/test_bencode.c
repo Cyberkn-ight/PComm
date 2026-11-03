@@ -63,7 +63,6 @@ static int encoded_is(const benc_t *node, const uint8_t *expected, size_t expect
     return ok;
 }
 
-/* Transfer a newly created node on success; free it on an add/set failure. */
 static int add_new(benc_t *list, benc_t *node) {
     if (node && benc_list_add(list, node) == 0) return 1;
     benc_free(node);

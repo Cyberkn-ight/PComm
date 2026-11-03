@@ -17,10 +17,6 @@ int pcomm_pack_packet(pcomm_msg_type_t type, const uint8_t eph_pub[32], const ui
 int pcomm_unpack_packet(const uint8_t *buf, uint32_t buf_len, pcomm_msg_type_t *type_out, uint8_t eph_pub_out[32],
                         uint8_t **payload_out, uint32_t *payload_len_out);
 
-/* Append one fragment without exceeding the maximum framed packet size.
- * Failure leaves the buffer and length unchanged. data may overlap the current
- * buffer; a zero-length append is a no-op and may use NULL data.
- */
 int pcomm_packet_append(uint8_t **buffer, uint32_t *length,
                          const uint8_t *data, uint32_t data_len);
 

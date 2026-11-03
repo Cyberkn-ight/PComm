@@ -64,7 +64,6 @@ done:
     return value;
 }
 
-/* Efficient setup for global quotas. Admission at each boundary still uses PUT. */
 static int seed_rows(pcomm_db_t *db, uint32_t count, uint32_t blob_len,
                      const uint8_t *shared_key, int64_t received) {
     sqlite3_stmt *st = NULL;

@@ -111,7 +111,7 @@ static int test_blocked_receive_and_owner_close(void) {
     while (!atomic_load(&waiter.started)) delay_ms(1);
     delay_ms(20);
     uint64_t before = now_ms();
-    /* Per-socket interruption also works before the process-wide stop flag. */
+
     net_shutdown(accepted);
     if (pthread_join(thread, NULL) != 0) abort();
     started = 0;

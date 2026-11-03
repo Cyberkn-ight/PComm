@@ -2,11 +2,14 @@
 #include "dht.h"
 #include "bencode.h"
 #include "crypto.h"
+#include "identity.h"
+#include "sign.h"
 #include "net.h"
 #include "lifecycle.h"
 
 #include <pthread.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdio.h>
@@ -17,6 +20,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <netdb.h>
 
 
 #define DHT_MAX_NODES        1024
@@ -45,6 +49,9 @@ typedef struct {
     int used;
     int done;
     benc_t *resp;
+    struct sockaddr_in expected;
+    uint8_t nonce[32];
+    int require_proof;
     pthread_cond_t cv;
 } pending_t;
 
@@ -53,6 +60,12 @@ typedef struct {
     uint8_t node_id[20];
     uint8_t secret[20];
     uint16_t listen_port;
+    uint16_t relay_port;
+    uint8_t public_key[32];
+    uint8_t private_key[32];
+    pcomm_bootstrap_t bootstrap[PCOMM_MAX_BOOTSTRAP];
+    time_t bootstrap_retry[PCOMM_MAX_BOOTSTRAP];
+    size_t bootstrap_count;
 
     int running;
     uint32_t maint_interval_sec;
@@ -178,7 +191,8 @@ static int addr_eq(const struct sockaddr_in *a, const struct sockaddr_in *b) {
 
 static int addr_is_valid(dht_state_t *st, const struct sockaddr_in *addr) {
     if (!addr || addr->sin_port == 0) return 0;
-    if (addr->sin_addr.s_addr == 0) return 0;
+    uint32_t ip = ntohl(addr->sin_addr.s_addr);
+    if ((ip >> 24) == 0 || (ip >> 24) >= 224) return 0;
     if (!st->allow_private_addrs) {
         if (net_addr_is_private(&addr->sin_addr, AF_INET)) return 0;
     }
@@ -187,6 +201,7 @@ static int addr_is_valid(dht_state_t *st, const struct sockaddr_in *addr) {
 
 static void add_node_locked(dht_state_t *st, const uint8_t id[20], const struct sockaddr_in *addr) {
     if (!addr_is_valid(st, addr)) return;
+    if (id && memcmp(id, st->node_id, 20) == 0) return;
 
     for (size_t i = 0; i < st->nodes_len; i++) {
         if (addr_eq(&st->nodes[i].addr, addr)) {
@@ -292,6 +307,9 @@ static void pending_free_locked(pending_t *p) {
     p->used = 0;
     p->done = 0;
     p->tx = 0;
+    p->require_proof = 0;
+    memset(&p->expected, 0, sizeof(p->expected));
+    OPENSSL_cleanse(p->nonce, sizeof(p->nonce));
 }
 
 static int send_krpc(dht_state_t *st, const struct sockaddr_in *to, const benc_t *msg) {
@@ -305,33 +323,66 @@ static int send_krpc(dht_state_t *st, const struct sockaddr_in *to, const benc_t
 }
 
 static uint16_t rand_tx(void) {
-    uint8_t r[2];
+    uint8_t r[2] = {0};
     (void)pcomm_random(r, 2);
     return (uint16_t)((r[0] << 8) | r[1]);
 }
 
+static int dict_add(benc_t *dict, const char *key, benc_t *value) {
+    if (!value || benc_dict_set(dict, key, value) != 0) {
+        benc_free(value);
+        return -1;
+    }
+    return 0;
+}
+
 static benc_t *krpc_build_query(dht_state_t *st, uint16_t tx, const char *q, benc_t *a) {
     benc_t *m = benc_new_dict();
-    if (!m) return NULL;
+    if (!m) { benc_free(a); return NULL; }
     uint8_t txb[2] = {(uint8_t)(tx >> 8), (uint8_t)(tx & 0xFF)};
-    benc_dict_set(m, "t", benc_new_str(txb, 2));
-    benc_dict_set(m, "y", benc_new_str((const uint8_t*)"q", 1));
-    benc_dict_set(m, "q", benc_new_str((const uint8_t*)q, strlen(q)));
-
     if (!a) a = benc_new_dict();
-    benc_dict_set(a, "id", benc_new_str(st->node_id, 20));
-    benc_dict_set(m, "a", a);
+    if (!a || dict_add(m, "t", benc_new_str(txb, 2)) ||
+        dict_add(m, "y", benc_new_str((const uint8_t*)"q", 1)) ||
+        dict_add(m, "q", benc_new_str((const uint8_t*)q, strlen(q))) ||
+        dict_add(a, "id", benc_new_str(st->node_id, 20))) {
+        benc_free(a); benc_free(m); return NULL;
+    }
+    if (dict_add(m, "a", a)) { benc_free(m); return NULL; }
     return m;
 }
 
-static benc_t *krpc_build_resp(dht_state_t *st, const uint8_t txb[2], benc_t *r) {
+static void proof_input(const uint8_t tx[2], const uint8_t nonce[32], const uint8_t node_id[20],
+                          const uint8_t public_key[32], uint16_t relay_port, uint8_t out[98]) {
+    memcpy(out, "PCOMM-DHT2", 10);
+    memcpy(out+10, tx, 2);
+    memcpy(out+12, nonce, 32);
+    memcpy(out+44, node_id, 20);
+    memcpy(out+64, public_key, 32);
+    out[96] = (uint8_t)(relay_port >> 8);
+    out[97] = (uint8_t)relay_port;
+}
+
+static benc_t *krpc_build_resp(dht_state_t *st, const uint8_t txb[2], benc_t *r, const uint8_t *nonce) {
     benc_t *m = benc_new_dict();
-    if (!m) return NULL;
-    benc_dict_set(m, "t", benc_new_str(txb, 2));
-    benc_dict_set(m, "y", benc_new_str((const uint8_t*)"r", 1));
+    if (!m) { benc_free(r); return NULL; }
     if (!r) r = benc_new_dict();
-    benc_dict_set(r, "id", benc_new_str(st->node_id, 20));
-    benc_dict_set(m, "r", r);
+    if (!r || dict_add(m, "t", benc_new_str(txb, 2)) ||
+        dict_add(m, "y", benc_new_str((const uint8_t*)"r", 1)) ||
+        dict_add(r, "id", benc_new_str(st->node_id, 20))) {
+        benc_free(r); benc_free(m); return NULL;
+    }
+    if (nonce) {
+        uint8_t input[98], signature[64];
+        proof_input(txb, nonce, st->node_id, st->public_key, st->relay_port, input);
+        if (pcomm_sign(st->private_key, input, sizeof(input), signature) ||
+            dict_add(r, "pcomm_pub", benc_new_str(st->public_key, 32)) ||
+            dict_add(r, "relay_port", benc_new_int(st->relay_port)) ||
+            dict_add(r, "pcomm_nonce", benc_new_str(nonce, 32)) ||
+            dict_add(r, "pcomm_sig", benc_new_str(signature, 64))) {
+            benc_free(r); benc_free(m); return NULL;
+        }
+    }
+    if (dict_add(m, "r", r)) { benc_free(m); return NULL; }
     return m;
 }
 
@@ -375,6 +426,8 @@ static void handle_query(dht_state_t *st, const struct sockaddr_in *from, benc_t
     benc_t *q = benc_dict_get(msg, "q");
     benc_t *a = benc_dict_get(msg, "a");
     if (!t || t->t != BENC_STR || t->slen != 2 || !q || q->t != BENC_STR) return;
+    benc_t *nonce_field = a ? benc_dict_get(a, "pcomm_nonce") : NULL;
+    const uint8_t *nonce = nonce_field && nonce_field->t == BENC_STR && nonce_field->slen == 32 ? nonce_field->s : NULL;
 
     // record node if possible
     if (a && a->t == BENC_DICT) {
@@ -391,7 +444,7 @@ static void handle_query(dht_state_t *st, const struct sockaddr_in *from, benc_t
     memcpy(qname, q->s, qn);
 
     if (strcmp(qname, "ping") == 0) {
-        benc_t *resp = krpc_build_resp(st, t->s, benc_new_dict());
+        benc_t *resp = krpc_build_resp(st, t->s, benc_new_dict(), nonce);
         send_krpc(st, from, resp);
         benc_free(resp);
         return;
@@ -432,7 +485,7 @@ static void handle_query(dht_state_t *st, const struct sockaddr_in *from, benc_t
             }
         }
 
-        benc_t *resp = krpc_build_resp(st, t->s, r);
+        benc_t *resp = krpc_build_resp(st, t->s, r, nonce);
         send_krpc(st, from, resp);
         benc_free(resp);
         return;
@@ -458,20 +511,26 @@ static void handle_query(dht_state_t *st, const struct sockaddr_in *from, benc_t
                 }
             }
         }
-        benc_t *resp = krpc_build_resp(st, t->s, benc_new_dict());
+        benc_t *resp = krpc_build_resp(st, t->s, benc_new_dict(), nonce);
         send_krpc(st, from, resp);
         benc_free(resp);
         return;
     }
 
-    benc_t *resp = krpc_build_resp(st, t->s, benc_new_dict());
+    benc_t *resp = krpc_build_resp(st, t->s, benc_new_dict(), nonce);
     send_krpc(st, from, resp);
     benc_free(resp);
 }
 
-static void handle_response(dht_state_t *st, benc_t *msg) {
+static int signed_response_peer(const struct sockaddr_in *from, const uint8_t tx[2], const uint8_t nonce[32],
+                                  benc_t *msg, pcomm_peer_t *peer);
+
+static void handle_response(dht_state_t *st, const struct sockaddr_in *from, benc_t *msg) {
     benc_t *t = benc_dict_get(msg, "t");
-    if (!t || t->t != BENC_STR || t->slen != 2) {
+    benc_t *r = benc_dict_get(msg, "r");
+    benc_t *id = r ? benc_dict_get(r, "id") : NULL;
+    if (!t || t->t != BENC_STR || t->slen != 2 || !r || r->t != BENC_DICT ||
+        !id || id->t != BENC_STR || id->slen != 20) {
         benc_free(msg);
         return;
     }
@@ -479,7 +538,21 @@ static void handle_response(dht_state_t *st, benc_t *msg) {
 
     pthread_mutex_lock(&st->mu);
     pending_t *p = pending_find_locked(st, tx);
-    if (p && st->running && !p->done) {
+    if (p && st->running && !p->done && addr_eq(&p->expected, from)) {
+        benc_t *nonce = benc_dict_get(r, "pcomm_nonce");
+        if (nonce && (nonce->t != BENC_STR || nonce->slen != 32 || CRYPTO_memcmp(nonce->s, p->nonce, 32))) {
+            pthread_mutex_unlock(&st->mu);
+            benc_free(msg);
+            return;
+        }
+        if (p->require_proof) {
+            pcomm_peer_t peer;
+            if (signed_response_peer(from, t->s, p->nonce, msg, &peer) || peer.port != ntohs(p->expected.sin_port)) {
+                pthread_mutex_unlock(&st->mu);
+                benc_free(msg);
+                return;
+            }
+        }
         p->resp = msg;
         p->done = 1;
         pthread_cond_broadcast(&p->cv);
@@ -500,10 +573,11 @@ static void *dht_rx_thread(void *arg) {
         ssize_t n = recvfrom(st->udp_fd, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fl);
         if (n <= 0) continue;
         if (!dht_running(st)) break;
+        if (fl != sizeof(from) || from.sin_family != AF_INET || !addr_is_valid(st, &from)) continue;
 
         benc_t *msg = NULL;
         size_t used = 0;
-        if (benc_parse(buf, (size_t)n, &msg, &used) != 0 || !msg || msg->t != BENC_DICT) {
+        if (benc_parse(buf, (size_t)n, &msg, &used) != 0 || !msg || msg->t != BENC_DICT || used != (size_t)n) {
             benc_free(msg);
             continue;
         }
@@ -517,7 +591,7 @@ static void *dht_rx_thread(void *arg) {
             handle_query(st, &from, msg);
             benc_free(msg);
         } else if (y->s[0] == 'r') {
-            handle_response(st, msg);
+            handle_response(st, &from, msg);
         } else {
             benc_free(msg);
         }
@@ -541,8 +615,10 @@ static int load_bootstrap_from_contacts(dht_state_t *st) {
         a.sin_family = AF_INET;
         a.sin_port = htons((uint16_t)port);
         if (inet_pton(AF_INET, host, &a.sin_addr) != 1) continue;
-        uint8_t nid[20];
-        sha1_bytes((const uint8_t*)pk, 32, nid);
+        uint8_t nid[20], binding[41];
+        memcpy(binding, "pcomm-dht", 9);
+        memcpy(binding+9, pk, 32);
+        sha1_bytes(binding, sizeof(binding), nid);
         pthread_mutex_lock(&st->mu);
         add_node_locked(st, nid, &a);
         pthread_mutex_unlock(&st->mu);
@@ -572,18 +648,99 @@ static int load_bootstrap_from_db_nodes(dht_state_t *st) {
     return 0;
 }
 
-static int krpc_query_one(dht_state_t *st, const struct sockaddr_in *to, benc_t *query, benc_t **resp_out) {
+static void load_bootstrap_from_config(dht_state_t *st) {
+    time_t now = time(NULL);
+    for (size_t i = 0; i < st->bootstrap_count && dht_running(st); i++) {
+        if (st->bootstrap_retry[i] > now && st->bootstrap_retry[i] <= now+600) continue;
+        struct addrinfo hints, *addresses = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        char service[6];
+        snprintf(service, sizeof(service), "%u", st->bootstrap[i].port);
+        st->bootstrap_retry[i] = now+10;
+        if (getaddrinfo(st->bootstrap[i].host, service, &hints, &addresses) != 0) continue;
+        int accepted = 0;
+        for (struct addrinfo *item = addresses; item && dht_running(st); item = item->ai_next) {
+            if (item->ai_family != AF_INET || item->ai_addrlen != sizeof(struct sockaddr_in)) continue;
+            const struct sockaddr_in *addr = (const struct sockaddr_in *)item->ai_addr;
+            if (!addr_is_valid(st, addr)) continue;
+            pthread_mutex_lock(&st->mu);
+            add_node_locked(st, NULL, addr);
+            pthread_mutex_unlock(&st->mu);
+            accepted = 1;
+        }
+        freeaddrinfo(addresses);
+        if (accepted) st->bootstrap_retry[i] = now+300;
+    }
+}
+
+static int signed_response_peer(const struct sockaddr_in *from, const uint8_t tx[2], const uint8_t nonce[32],
+                                  benc_t *msg, pcomm_peer_t *peer) {
+    benc_t *r = benc_dict_get(msg, "r");
+    benc_t *id = r ? benc_dict_get(r, "id") : NULL;
+    if (!id || id->t != BENC_STR || id->slen != 20) return -1;
+    benc_t *public_key = benc_dict_get(r, "pcomm_pub");
+    benc_t *relay_port = benc_dict_get(r, "relay_port");
+    benc_t *reply_nonce = benc_dict_get(r, "pcomm_nonce"), *signature = benc_dict_get(r, "pcomm_sig");
+    if (!public_key || public_key->t != BENC_STR || public_key->slen != 32 ||
+        !relay_port || relay_port->t != BENC_INT || relay_port->i <= 0 || relay_port->i > 65535 ||
+        !reply_nonce || reply_nonce->t != BENC_STR || reply_nonce->slen != 32 ||
+        CRYPTO_memcmp(reply_nonce->s, nonce, 32) || !signature || signature->t != BENC_STR || signature->slen != 64) return -1;
+    uint8_t binding[41], expected[20], input[98];
+    memcpy(binding, "pcomm-dht", 9);
+    memcpy(binding+9, public_key->s, 32);
+    sha1_bytes(binding, sizeof(binding), expected);
+    if (memcmp(expected, id->s, 20) != 0) return -1;
+    proof_input(tx, nonce, id->s, public_key->s, (uint16_t)relay_port->i, input);
+    if (pcomm_verify(public_key->s, input, sizeof(input), signature->s)) return -1;
+    memset(peer, 0, sizeof(*peer));
+    if (pcomm_user_id_from_pubkey(public_key->s, peer->user_id) != 0 ||
+        !inet_ntop(AF_INET, &from->sin_addr, peer->host, sizeof(peer->host))) return -1;
+    memcpy(peer->pubkey, public_key->s, 32);
+    peer->port = (uint16_t)relay_port->i;
+    return 0;
+}
+
+static void learn_response_peer(dht_state_t *st, const struct sockaddr_in *from, const uint8_t tx[2],
+                                  const uint8_t nonce[32], benc_t *msg) {
+    benc_t *r = benc_dict_get(msg, "r");
+    benc_t *id = r ? benc_dict_get(r, "id") : NULL;
+    if (!id || id->t != BENC_STR || id->slen != 20 || !addr_is_valid(st, from)) return;
+    pthread_mutex_lock(&st->mu);
+    add_node_locked(st, id->s, from);
+    pthread_mutex_unlock(&st->mu);
+    pcomm_peer_t peer;
+    if (signed_response_peer(from, tx, nonce, msg, &peer) || memcmp(peer.pubkey, st->public_key, 32) == 0) return;
+    (void)pcomm_db_upsert_contact(st->db, peer.user_id, peer.host, peer.port, peer.pubkey, 1);
+}
+
+static int krpc_query_one_impl(dht_state_t *st, const struct sockaddr_in *to, benc_t *query,
+                                benc_t **resp_out, int require_proof) {
     *resp_out = NULL;
     benc_t *t = benc_dict_get(query, "t");
-    if (!t || t->t != BENC_STR || t->slen != 2) return -1;
-    uint16_t tx = (uint16_t)((t->s[0] << 8) | t->s[1]);
+    benc_t *a = benc_dict_get(query, "a");
+    if (!t || t->t != BENC_STR || t->slen != 2 || !addr_is_valid(st, to)) return -1;
+    uint8_t nonce[32];
+    if (!a || a->t != BENC_DICT || pcomm_random(nonce, sizeof(nonce)) ||
+        dict_add(a, "pcomm_nonce", benc_new_str(nonce, sizeof(nonce)))) return -1;
 
     pthread_mutex_lock(&st->mu);
     if (!st->running || pcomm_shutdown_requested()) {
         pthread_mutex_unlock(&st->mu);
         return -1;
     }
-    pending_t *p = pending_alloc_locked(st, tx);
+    pending_t *p = NULL;
+    for (unsigned attempt = 0; attempt < 256; attempt++) {
+        if (pcomm_random(t->s, 2) != 0) break;
+        uint16_t tx = (uint16_t)((t->s[0] << 8) | t->s[1]);
+        if (!pending_find_locked(st, tx)) { p = pending_alloc_locked(st, tx); break; }
+    }
+    if (p) {
+        p->expected = *to;
+        p->require_proof = require_proof;
+        memcpy(p->nonce, nonce, sizeof(p->nonce));
+    }
     pthread_mutex_unlock(&st->mu);
     if (!p) return -1;
 
@@ -614,7 +771,51 @@ static int krpc_query_one(dht_state_t *st, const struct sockaddr_in *to, benc_t 
     pending_free_locked(p);
     pthread_mutex_unlock(&st->mu);
 
+    if (*resp_out) learn_response_peer(st, to, t->s, nonce, *resp_out);
     return (*resp_out) ? 0 : -1;
+}
+
+static int krpc_query_one(dht_state_t *st, const struct sockaddr_in *to, benc_t *query, benc_t **resp_out) {
+    return krpc_query_one_impl(st, to, query, resp_out, 0);
+}
+
+int pcomm_dht_resolve_relay(const char *host, uint16_t port, pcomm_peer_t *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!host || !*host || strlen(host) >= 64 || !port) return -1;
+    dht_state_t *st = dht_acquire();
+    if (!st) return -1;
+    struct addrinfo hints, *addresses = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
+    char service[6];
+    snprintf(service, sizeof(service), "%u", port);
+    int rc = -1;
+    if (getaddrinfo(host, service, &hints, &addresses) != 0) goto done;
+    unsigned queried = 0;
+    for (struct addrinfo *item = addresses; item && queried < 8 && dht_running(st); item = item->ai_next) {
+        if (item->ai_family != AF_INET || item->ai_addrlen != sizeof(struct sockaddr_in)) continue;
+        const struct sockaddr_in *to = (const struct sockaddr_in *)item->ai_addr;
+        if (!addr_is_valid(st, to)) continue;
+        queried++;
+        benc_t *query = krpc_build_query(st, rand_tx(), "ping", NULL), *response = NULL;
+        if (!query) continue;
+        if (krpc_query_one_impl(st, to, query, &response, 1) == 0 && response) {
+            benc_t *t = benc_dict_get(query, "t"), *a = benc_dict_get(query, "a");
+            benc_t *nonce = a ? benc_dict_get(a, "pcomm_nonce") : NULL;
+            pcomm_peer_t peer;
+            if (t && nonce && !signed_response_peer(to, t->s, nonce->s, response, &peer) && peer.port == port) {
+                *out = peer; rc = 0;
+            }
+        }
+        benc_free(response); benc_free(query);
+        if (!rc) break;
+    }
+done:
+    if (addresses) freeaddrinfo(addresses);
+    if (!dht_running(st)) { memset(out, 0, sizeof(*out)); rc = -1; }
+    dht_release(st);
+    return rc;
 }
 
 static void dht_prune_locked(dht_state_t *st) {
@@ -655,8 +856,11 @@ static void dht_refresh_once(dht_state_t *st) {
     }
 
     size_t take = st->nodes_len < 16 ? st->nodes_len : 16;
+    uint32_t random = 0;
+    (void)pcomm_random((uint8_t *)&random, sizeof(random));
+    size_t first = random % st->nodes_len;
     for (size_t i = 0; i < take; i++) {
-        size_t idx = (size_t)(rand() % (int)st->nodes_len);
+        size_t idx = (first+i) % st->nodes_len;
         work[wlen++] = st->nodes[idx].addr;
     }
 
@@ -707,6 +911,7 @@ static void dht_refresh_once(dht_state_t *st) {
 static void *dht_maint_thread(void *arg) {
     dht_state_t *st = (dht_state_t*)arg;
     while (dht_running(st)) {
+        load_bootstrap_from_config(st);
         dht_refresh_once(st);
         dht_flush_nodes_to_db(st);
         if (dht_wait(st, (uint64_t)st->maint_interval_sec * 1000u) != 0) break;
@@ -752,10 +957,19 @@ int pcomm_dht_get_peers_hosts(const uint8_t infohash20[20],
                         uint16_t p;
                         memcpy(&p, s->s + 4, 2);
                         p = ntohs(p);
-                        if (p == 0) continue;
-                        if (!st->allow_private_addrs && net_addr_is_private(&ip, AF_INET)) continue;
+                        struct sockaddr_in candidate;
+                        memset(&candidate, 0, sizeof(candidate));
+                        candidate.sin_family = AF_INET;
+                        candidate.sin_addr = ip;
+                        candidate.sin_port = htons(p);
+                        if (!addr_is_valid(st, &candidate)) continue;
                         char ipstr[64];
-                        inet_ntop(AF_INET, &ip, ipstr, sizeof(ipstr));
+                        if (!inet_ntop(AF_INET, &ip, ipstr, sizeof(ipstr))) continue;
+                        int duplicate = 0;
+                        for (size_t j = 0; j < *out_len; j++) {
+                            if (ports[j] == p && strcmp(hosts[j], ipstr) == 0) { duplicate = 1; break; }
+                        }
+                        if (duplicate) continue;
                         snprintf(hosts[*out_len], 64, "%s", ipstr);
                         ports[*out_len] = p;
                         (*out_len)++;
@@ -847,11 +1061,45 @@ static void dht_free_state(dht_state_t *st) {
     }
     pthread_cond_destroy(&st->users_done);
     pthread_mutex_destroy(&st->mu);
+    OPENSSL_cleanse(st, sizeof(*st));
     free(st);
 }
 
+static int bind_dht_socket(dht_state_t *st, const pcomm_config_t *cfg) {
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(cfg->relay_port);
+    if (inet_pton(AF_INET, cfg->relay_host, &address.sin_addr) == 1) {
+        uint32_t ip = ntohl(address.sin_addr.s_addr);
+        if (ip && ((ip >> 24) == 0 || (ip >> 24) >= 224)) return -1;
+        return bind(st->udp_fd, (struct sockaddr *)&address, sizeof(address));
+    }
+    struct addrinfo hints, *addresses = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
+    char service[6];
+    snprintf(service, sizeof(service), "%u", cfg->relay_port);
+    if (getaddrinfo(cfg->relay_host, service, &hints, &addresses)) return -1;
+    int rc = -1;
+    for (struct addrinfo *item = addresses; item && dht_running(st); item = item->ai_next) {
+        if (item->ai_family != AF_INET || item->ai_addrlen != sizeof(address)) continue;
+        const struct sockaddr_in *candidate = (const struct sockaddr_in *)item->ai_addr;
+        uint32_t ip = ntohl(candidate->sin_addr.s_addr);
+        if ((ip >> 24) == 0 || (ip >> 24) >= 224) continue;
+        if (bind(st->udp_fd, item->ai_addr, item->ai_addrlen) == 0) { rc = 0; break; }
+    }
+    freeaddrinfo(addresses);
+    return rc;
+}
+
 int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db) {
-    if (!cfg || !me || !db || !db->db || pcomm_shutdown_requested()) return -1;
+    if (!cfg || !me || !db || !db->db || cfg->bootstrap_count > PCOMM_MAX_BOOTSTRAP ||
+        !memchr(cfg->relay_host, 0, sizeof(cfg->relay_host)) || !cfg->relay_host[0] || pcomm_shutdown_requested()) return -1;
+    for (size_t i = 0; i < cfg->bootstrap_count; i++) {
+        if (!memchr(cfg->bootstrap[i].host, 0, sizeof(cfg->bootstrap[i].host)) ||
+            !cfg->bootstrap[i].host[0] || !cfg->bootstrap[i].port) return -1;
+    }
     pthread_mutex_lock(&g_dht_mu);
     if (g_dht) {
         int rc = dht_running(g_dht) ? 0 : -1;
@@ -882,6 +1130,11 @@ int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm
     }
     st->db = db;
     st->listen_port = cfg->relay_port;
+    st->relay_port = cfg->advertise_port ? cfg->advertise_port : cfg->relay_port;
+    memcpy(st->public_key, me->pubkey, 32);
+    memcpy(st->private_key, me->privkey, 32);
+    st->bootstrap_count = cfg->bootstrap_count;
+    memcpy(st->bootstrap, cfg->bootstrap, cfg->bootstrap_count*sizeof(cfg->bootstrap[0]));
     st->running = 1;
     st->maint_interval_sec = cfg->dht_maint_interval_sec > 3 ? cfg->dht_maint_interval_sec : 10;
     st->allow_private_addrs = cfg->allow_private_addrs ? 1 : 0;
@@ -898,12 +1151,7 @@ int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm
     if (setsockopt(st->udp_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
         setsockopt(st->udp_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0) goto fail;
 
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
-    a.sin_port = htons(cfg->relay_port);
-    if (bind(st->udp_fd, (struct sockaddr*)&a, sizeof(a)) != 0) goto fail;
+    if (bind_dht_socket(st, cfg) != 0) goto fail;
 
     load_bootstrap_from_contacts(st);
     load_bootstrap_from_db_nodes(st);

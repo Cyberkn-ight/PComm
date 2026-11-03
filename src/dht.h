@@ -7,7 +7,7 @@
 #include <stddef.h>
 
 int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db);
-/* Wake pending queries first; keep state alive until DHT consumers have stopped. */
+
 void pcomm_dht_request_stop(void);
 void pcomm_dht_stop(void);
 
@@ -19,5 +19,7 @@ int pcomm_dht_announce(const uint8_t infohash20[20], uint16_t port);
 int pcomm_dht_get_peers_hosts(const uint8_t infohash20[20],
                              char (*hosts)[64], uint16_t *ports,
                              size_t cap, size_t *out_len);
+
+int pcomm_dht_resolve_relay(const char *host, uint16_t port, pcomm_peer_t *out);
 
 #endif

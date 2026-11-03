@@ -128,7 +128,7 @@ static int admit(pcomm_mailbox_guard_t *guard,
         if (source->used) {
             refill(&source->bucket, now_ms, PCOMM_MAILBOX_IP_BURST,
                    PCOMM_MAILBOX_IP_INTERVAL_MS);
-            /* Fully restored budgets can be recreated without granting credit. */
+
             if (source->bucket.tokens == PCOMM_MAILBOX_IP_BURST) {
                 memset(source, 0, sizeof(*source));
             } else if (memcmp(source->source_hash, hash, SHA256_DIGEST_LENGTH) == 0) {

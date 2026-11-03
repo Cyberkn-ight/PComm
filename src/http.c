@@ -322,16 +322,19 @@ static int api_create_group(http_state_t *st, int fd, const char *body) {
         pcomm_db_add_participant(st->db, conv_id, members[i]);
     }
 
+    int queued = 0, failed = 0;
     for (int i = 0; i < mcount; i++) {
         if (strcmp(members[i], st->me.user_id) == 0) continue;
-        pcomm_hidden_send_group_invite(st->db, &st->cfg, &st->me, members[i], uuid, title, members, mcount);
+        if (pcomm_hidden_send_group_invite(st->db, &st->cfg, &st->me, members[i], uuid, title, members, mcount) == 0) queued++;
+        else failed++;
     }
 
     for (int i = 0; i < mcount; i++) free(members[i]);
 
     sb_t sb; sb_init(&sb);
-    sb_appendf(&sb, "{\"ok\":true,\"id\":%lld,\"uuid\":\"%s\"}", (long long)conv_id, uuid);
-    int rc = send_resp(fd, 200, "application/json; charset=utf-8", sb.buf, sb.len);
+    sb_appendf(&sb, "{\"ok\":%s,\"id\":%lld,\"uuid\":\"%s\",\"queued\":%d,\"failed\":%d}",
+               failed ? "false" : "true", (long long)conv_id, uuid, queued, failed);
+    int rc = send_resp(fd, failed ? 503 : 200, "application/json; charset=utf-8", sb.buf, sb.len);
     sb_free(&sb);
     return rc;
 }
@@ -357,18 +360,28 @@ static int api_send_group(http_state_t *st, int fd, const char *body) {
         return send_resp(fd, 500, "text/plain", "db error", 8);
     }
 
+    int queued = 0, failed = 0;
     for (int i = 0; i < mcount; i++) {
         if (!members[i]) continue;
         if (strcmp(members[i], st->me.user_id) == 0) continue;
-        pcomm_hidden_send_group_text(st->db, &st->cfg, &st->me, members[i], uuid, text);
+        if (pcomm_hidden_send_group_text(st->db, &st->cfg, &st->me, members[i], uuid, text) == 0) queued++;
+        else failed++;
     }
 
-    pcomm_db_insert_message(st->db, conv_id, 1, uuid, st->me.user_id, text, (const uint8_t*)"", 0, (int64_t)time(NULL));
+    int store_history = queued > 0 || failed == 0;
+    int history_saved = store_history && pcomm_db_insert_message(st->db, conv_id, 1, uuid, st->me.user_id,
+        text, (const uint8_t*)"", 0, (int64_t)time(NULL)) == 0;
+    int history_error = store_history && !history_saved;
 
     for (int i = 0; i < mcount; i++) free(members[i]);
     free(members);
 
-    return send_resp(fd, 200, "application/json; charset=utf-8", "{\"ok\":true}", 11);
+    sb_t sb; sb_init(&sb);
+    sb_appendf(&sb, "{\"ok\":%s,\"queued\":%d,\"failed\":%d,\"history_saved\":%s}",
+               failed || history_error ? "false" : "true", queued, failed, history_saved ? "true" : "false");
+    int rc = send_resp(fd, failed || history_error ? 503 : 200, "application/json; charset=utf-8", sb.buf, sb.len);
+    sb_free(&sb);
+    return rc;
 }
 
 static int api_add_contact(http_state_t *st, int fd, const char *body) {

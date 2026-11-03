@@ -34,7 +34,7 @@ typedef struct stream_wait {
 } stream_wait_t;
 
 struct pcomm_circuit {
-    atomic_int fd; // TCP connection to guard; closed after its workers join
+    atomic_int fd;
     pcomm_peer_t path[PCOMM_MAX_HOPS];
     size_t nhops;
 
@@ -68,8 +68,8 @@ struct pcomm_circuit {
     pcomm_config_t cfg;
 
     int is_dedicated;
-    size_t refs;             /* guarded by g_mgr_mu */
-    int owner_released;      /* closing never consumes a borrower's reference */
+    size_t refs;
+    int owner_released;
     struct pcomm_circuit *registry_next;
 };
 
@@ -345,7 +345,6 @@ static uint16_t alloc_stream_id_locked(pcomm_circuit_t *c) {
     return sid;
 }
 
-
 static void *rx_loop(void *arg) {
     pcomm_circuit_t *c = (pcomm_circuit_t*)arg;
 
@@ -477,7 +476,6 @@ done:
     atomic_store(&c->maint_done, 1);
     return NULL;
 }
-
 
 static int db_pick_random_relays(pcomm_db_t *db,
                                 const char *exclude1,
@@ -703,7 +701,6 @@ static void circuit_reap_closed(void) {
         circuit_destroy(c);
     }
 }
-
 
 static pcomm_circuit_t *build_new_circuit(int is_dedicated,
                                          const char *exit_host,

@@ -9,10 +9,13 @@
 #include "identity.h"
 #include "lifecycle.h"
 #include "mesh.h"
+#include "msg.h"
 #include "net.h"
 #include "proto.h"
+#include "ratchet.h"
 #include "relay.h"
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -246,7 +249,8 @@ done:
     return rc;
 }
 
-static int receive_relay(int fd, const uint8_t key[32], uint8_t expected, uint16_t expected_sid) {
+static int receive_relay_body(int fd, const uint8_t key[32], uint8_t expected, uint16_t expected_sid,
+                               const uint8_t *expected_body, uint16_t expected_len) {
     pcomm_msg_type_t type;
     uint8_t eph[32], *packet = NULL, *plain = NULL;
     const uint8_t *body, *relay_body;
@@ -260,7 +264,8 @@ static int receive_relay(int fd, const uint8_t key[32], uint8_t expected, uint16
     if (pcomm_relay_unwrap_backward_all((const uint8_t (*)[32])key, 1, 1, body, body_len,
                                        &plain, &plain_len) != 0 ||
         pcomm_relay_plain_unpack(plain, plain_len, &relay_command, &sid, &relay_body, &relay_len) != 0 ||
-        relay_command != expected || sid != expected_sid || relay_len != 0) goto done;
+        relay_command != expected || sid != expected_sid || relay_len != expected_len ||
+        (expected_len > 0 && memcmp(relay_body, expected_body, expected_len) != 0)) goto done;
     rc = 0;
 done:
     free(packet);
@@ -268,12 +273,14 @@ done:
     return rc;
 }
 
-static int buffered_relay_stream(const pcomm_config_t *cfg, int *client_out) {
+static int receive_relay(int fd, const uint8_t key[32], uint8_t expected, uint16_t expected_sid) {
+    return receive_relay_body(fd, key, expected, expected_sid, NULL, 0);
+}
+
+static int create_one_hop(const pcomm_config_t *cfg, int *client_out, uint8_t hop_keys[64]) {
     pcomm_identity_t ephemeral;
-    uint8_t server_public[32], shared[32], hop_keys[64];
+    uint8_t server_public[32], shared[32];
     const uint8_t salt[] = "pcomm-circ-v1", info[] = "pcomm-hop-keys";
-    const uint8_t data[] = "request buffered without RELAY_END";
-    uint8_t begin[13] = {9};
     struct timeval timeout = {2, 0};
     *client_out = net_connect_tcp("127.0.0.1", cfg->relay_port);
     if (*client_out < 0 || setsockopt(*client_out, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
@@ -281,7 +288,14 @@ static int buffered_relay_stream(const pcomm_config_t *cfg, int *client_out) {
         receive_created(*client_out, server_public) != 0 ||
         pcomm_x25519_derive(ephemeral.privkey, server_public, shared) != 0 ||
         pcomm_hkdf_sha256(shared, sizeof(shared), salt, sizeof(salt) - 1, info, sizeof(info) - 1,
-                          hop_keys, sizeof(hop_keys)) != 0) return -1;
+                          hop_keys, 64) != 0) return -1;
+    return 0;
+}
+
+static int buffered_relay_stream(const pcomm_config_t *cfg, int *client_out) {
+    uint8_t hop_keys[64], begin[13] = {9};
+    const uint8_t data[] = "request buffered without RELAY_END";
+    if (create_one_hop(cfg, client_out, hop_keys) != 0) return -1;
     memcpy(begin + 1, "127.0.0.1", 9);
     begin[10] = (uint8_t)(cfg->relay_port >> 8);
     begin[11] = (uint8_t)cfg->relay_port;
@@ -294,10 +308,30 @@ static int buffered_relay_stream(const pcomm_config_t *cfg, int *client_out) {
     return 0;
 }
 
+static int paired_rendezvous(const pcomm_config_t *cfg, int *client_a, int *client_b) {
+    uint8_t keys_a[64], keys_b[64], cookie[20], established[21];
+    for (size_t i = 0; i < sizeof(cookie); i++) cookie[i] = (uint8_t)(i * 7u + 1u);
+    memcpy(established, cookie, sizeof(cookie));
+    established[20] = 1;
+    if (create_one_hop(cfg, client_a, keys_a) != 0 ||
+        create_one_hop(cfg, client_b, keys_b) != 0 ||
+        send_relay(*client_a, keys_a, PCOMM_RELAY_ESTABLISH_RENDEZVOUS, 0,
+                    cookie, sizeof(cookie)) != 0 ||
+        send_relay(*client_a, keys_a, PCOMM_RELAY_PING, 0, NULL, 0) != 0 ||
+        receive_relay(*client_a, keys_a + 32, PCOMM_RELAY_PONG, 0) != 0 ||
+        send_relay(*client_b, keys_b, PCOMM_RELAY_RENDEZVOUS1, 0,
+                    cookie, sizeof(cookie)) != 0 ||
+        receive_relay_body(*client_a, keys_a + 32, PCOMM_RELAY_RENDEZVOUS2, 0,
+                            established, sizeof(established)) != 0 ||
+        receive_relay_body(*client_b, keys_b + 32, PCOMM_RELAY_RENDEZVOUS2, 0,
+                            established, sizeof(established)) != 0) return -1;
+    return 0;
+}
+
 static int restart_cycle(const pcomm_config_t *cfg, unsigned cycle) {
     pcomm_db_t db = {0};
     pcomm_identity_t identity;
-    int http_client = -1, relay_client = -1;
+    int http_client = -1, relay_client = -1, rendezvous_client = -1;
     int ok = 1;
     CHECK(net_tracked_socket_count() == 0);
     pcomm_shutdown_reset();
@@ -313,16 +347,19 @@ static int restart_cycle(const pcomm_config_t *cfg, unsigned cycle) {
         CHECK(wait_for_socket_count(6, 2000) == 0);
     } else if (cycle == 2) {
         CHECK(buffered_relay_stream(cfg, &relay_client) == 0);
+    } else if (cycle == 3) {
+        CHECK(paired_rendezvous(cfg, &relay_client, &rendezvous_client) == 0);
     } else {
         poll(NULL, 0, 50);
     }
 
     uint64_t started = now_ms();
     stop_all();
-    stop_all(); /* Repeated stop calls must be harmless. */
+    stop_all();
     CHECK(now_ms() - started < 5000u);
     close_managed(&http_client);
     close_managed(&relay_client);
+    close_managed(&rendezvous_client);
     CHECK(net_tracked_socket_count() == 0);
     CHECK(ports_are_reusable(cfg) == 0);
     CHECK(db_close_checked(&db) == 0);
@@ -330,6 +367,7 @@ done:
     stop_all();
     close_managed(&http_client);
     close_managed(&relay_client);
+    close_managed(&rendezvous_client);
     pcomm_db_close(&db);
     return ok;
 }
@@ -337,7 +375,7 @@ done:
 static int test_repeated_start_stop(const char *ui_dir) {
     pcomm_config_t cfg;
     if (config_for_test(&cfg, ui_dir) != 0) return 0;
-    for (unsigned cycle = 0; cycle < 3; cycle++) {
+    for (unsigned cycle = 0; cycle < 4; cycle++) {
         if (!restart_cycle(&cfg, cycle)) return 0;
     }
     return 1;
@@ -366,7 +404,7 @@ static int observe_blocked_bootstrap(reserved_port_t *fake, int accepted[32], si
             ssize_t count = recvfrom(fake->udp, datagram, sizeof(datagram), 0,
                                      (struct sockaddr *)&from, &from_len);
             if (count <= 0 || from.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) return -1;
-            saw_udp = 1; /* Deliberately drop queries instead of answering. */
+            saw_udp = 1;
         }
         for (size_t i = 0; i < *accepted_count; i++) {
             uint8_t frame[PCOMM_HDR_LEN + 1];
@@ -477,8 +515,215 @@ done:
     stop_all();
     close_raw(&blocker);
     pcomm_db_close(&db);
-    /* A failed startup must leave all globals reusable for a complete start. */
+
     if (ok) ok = restart_cycle(&cfg, 0);
+    return ok;
+}
+
+static sqlite3_int64 queue_test_value(pcomm_db_t *db, const char *sql, const char *peer) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 value = -1;
+    if (sqlite3_prepare_v2(db->db, sql, -1, &st, NULL) == SQLITE_OK) {
+        if (peer) sqlite3_bind_text(st, 1, peer, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) value = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return value;
+}
+
+static int queue_test_post(const pcomm_config_t *cfg, const char *path,
+                            const char *body, char *response, size_t capacity) {
+    int fd = net_connect_tcp("127.0.0.1", cfg->http_port);
+    if (fd < 0) return -1;
+    struct timeval timeout = {2, 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    char request[1024];
+    int len = snprintf(request, sizeof(request),
+        "POST %s HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+        "Content-Length: %zu\r\n\r\n%s", path, strlen(body), body);
+    int status = -1;
+    size_t used = 0;
+    if (len < 0 || (size_t)len >= sizeof(request) || net_sendall(fd, request, (size_t)len)) goto done;
+    while (used < capacity-1) {
+        ssize_t count = recv(fd, response+used, capacity-1-used, 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) goto done;
+        if (!count) break;
+        used += (size_t)count;
+    }
+    response[used] = '\0';
+    if (sscanf(response, "HTTP/%*d.%*d %d", &status) != 1) status = -1;
+done:
+    response[used] = '\0';
+    net_close(fd);
+    return status;
+}
+
+static int queue_state_is_empty(pcomm_db_t *db) {
+    return queue_test_value(db, "SELECT count(*) FROM ratchet_sessions", NULL) == 0 &&
+        queue_test_value(db, "SELECT count(*) FROM ratchet_pending", NULL) == 0 &&
+        queue_test_value(db, "SELECT count(*) FROM ratchet_outbox", NULL) == 0 &&
+        queue_test_value(db, "SELECT count(*) FROM messages", NULL) == 0;
+}
+
+static int test_http_reports_ratchet_admission_failure(const char *ui_dir) {
+    pcomm_config_t cfg;
+    pcomm_db_t db = {0};
+    pcomm_identity_t identity, admitted, rejected;
+    reserved_port_t unavailable = {-1, -1, 0};
+    char body[512], response[4096], *trigger = NULL;
+    int ok = 1;
+    CHECK(net_tracked_socket_count() == 0);
+    pcomm_shutdown_reset();
+    CHECK(config_for_test(&cfg, ui_dir) == 0 && db_open_memory(&db) == 0);
+    CHECK(make_identity(&identity) == 0 && make_identity(&admitted) == 0 && make_identity(&rejected) == 0);
+    CHECK(sqlite3_exec(db.db, "CREATE TRIGGER reject_pending BEFORE INSERT ON ratchet_pending "
+                             "BEGIN SELECT RAISE(FAIL, 'queue admission rejected'); END;",
+                       NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(pcomm_http_start(&cfg, &identity, &db) == 0);
+
+    snprintf(body, sizeof(body), "title=Rejected&members=%s", rejected.user_id);
+    CHECK(queue_test_post(&cfg, "/api/create_group", body, response, sizeof(response)) == 503);
+    CHECK(strstr(response, "\"ok\":false") && strstr(response, "\"queued\":0,\"failed\":1"));
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM conversations WHERE type='group'", NULL) == 1);
+    CHECK(queue_state_is_empty(&db));
+    sqlite3_int64 rejected_group = queue_test_value(&db,
+        "SELECT id FROM conversations WHERE type='group' ORDER BY id DESC LIMIT 1", NULL);
+    CHECK(rejected_group > 0);
+
+    snprintf(body, sizeof(body), "conv=%lld&text=rejected-group-history", (long long)rejected_group);
+    CHECK(queue_test_post(&cfg, "/api/send_group", body, response, sizeof(response)) == 503);
+    CHECK(strstr(response, "\"queued\":0,\"failed\":1") && strstr(response, "\"history_saved\":false"));
+    CHECK(queue_state_is_empty(&db));
+
+    snprintf(body, sizeof(body), "to=%s&text=rejected-direct-history", rejected.user_id);
+    CHECK(queue_test_post(&cfg, "/api/send", body, response, sizeof(response)) == 500);
+    CHECK(strstr(response, "\"ok\":false"));
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM conversations WHERE type='direct'", NULL) == 0);
+    CHECK(queue_state_is_empty(&db));
+
+    CHECK(reserve_port(&unavailable) == 0);
+    CHECK(pcomm_db_upsert_contact(&db, admitted.user_id, "127.0.0.1", unavailable.port, admitted.pubkey, 0) == 0);
+    CHECK(pcomm_db_upsert_contact(&db, rejected.user_id, "127.0.0.1", unavailable.port, rejected.pubkey, 0) == 0);
+    CHECK(sqlite3_exec(db.db, "DROP TRIGGER reject_pending", NULL, NULL, NULL) == SQLITE_OK);
+    trigger = sqlite3_mprintf("CREATE TRIGGER reject_pending BEFORE INSERT ON ratchet_pending "
+        "WHEN NEW.peer=%Q BEGIN SELECT RAISE(FAIL, 'one peer rejected'); END;", rejected.user_id);
+    CHECK(trigger && sqlite3_exec(db.db, trigger, NULL, NULL, NULL) == SQLITE_OK);
+    sqlite3_free(trigger); trigger = NULL;
+
+    snprintf(body, sizeof(body), "title=Partial&members=%s,%s", admitted.user_id, rejected.user_id);
+    CHECK(queue_test_post(&cfg, "/api/create_group", body, response, sizeof(response)) == 503);
+    CHECK(strstr(response, "\"ok\":false") && strstr(response, "\"queued\":1,\"failed\":1"));
+    sqlite3_int64 partial_group = queue_test_value(&db,
+        "SELECT id FROM conversations WHERE type='group' ORDER BY id DESC LIMIT 1", NULL);
+    CHECK(partial_group > rejected_group);
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM ratchet_sessions WHERE peer=?", admitted.user_id) == 1);
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM ratchet_sessions WHERE peer=?", rejected.user_id) == 0);
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM ratchet_pending", NULL) == 1);
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM ratchet_outbox", NULL) == 1);
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM messages", NULL) == 0);
+
+    snprintf(body, sizeof(body), "conv=%lld&text=partial-admission-history", (long long)partial_group);
+    CHECK(queue_test_post(&cfg, "/api/send_group", body, response, sizeof(response)) == 503);
+    CHECK(strstr(response, "\"queued\":1,\"failed\":1") && strstr(response, "\"history_saved\":true"));
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM messages WHERE direction=1 AND body='partial-admission-history'", NULL) == 1);
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM ratchet_pending WHERE peer=?", admitted.user_id) == 2);
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM ratchet_pending WHERE peer=?", rejected.user_id) == 0);
+    CHECK(queue_test_value(&db, "SELECT count(*) FROM ratchet_outbox", NULL) == 1);
+    pcomm_http_stop();
+    CHECK(net_tracked_socket_count() == 0);
+    CHECK(db_close_checked(&db) == 0);
+done:
+    stop_all();
+    sqlite3_free(trigger);
+    release_port(&unavailable);
+    pcomm_db_close(&db);
+    return ok;
+}
+
+static int local_mailbox_key(const char *recipient, uint32_t epoch, uint8_t key[32]) {
+    const char tag[] = "pcomm-mb-v1";
+    uint8_t input[160];
+    size_t identity_length = strlen(recipient);
+    size_t length = sizeof(tag);
+    if (length + identity_length + 5 > sizeof(input)) return -1;
+    memcpy(input, tag, length);
+    memcpy(input + length, recipient, identity_length); length += identity_length;
+    input[length++] = 0;
+    input[length++] = (uint8_t)(epoch >> 24); input[length++] = (uint8_t)(epoch >> 16);
+    input[length++] = (uint8_t)(epoch >> 8); input[length++] = (uint8_t)epoch;
+    unsigned digest_length = 0;
+    return EVP_Digest(input, length, key, &digest_length, EVP_sha256(), NULL) == 1 && digest_length == 32 ? 0 : -1;
+}
+
+static int test_local_mailbox_accepts_ratchet_offer(const char *ui_dir) {
+    pcomm_config_t cfg;
+    pcomm_db_t recipient_db = {0}, sender_db = {0};
+    pcomm_identity_t recipient = {0}, sender = {0};
+    pcomm_ratchet_outgoing_t outgoing = {0};
+    uint8_t *plain = NULL, *offer = NULL, key[32];
+    size_t plain_length = 0, offer_length = 0;
+    int received = 0, ok = 1;
+    CHECK(net_tracked_socket_count() == 0);
+    pcomm_shutdown_reset();
+    CHECK(config_for_test(&cfg, ui_dir) == 0);
+    cfg.mailbox_poll_base_ms = 800;
+    CHECK(db_open_memory(&recipient_db) == 0 && db_open_memory(&sender_db) == 0);
+    CHECK(make_identity(&recipient) == 0 && make_identity(&sender) == 0);
+    time_t wall_time = time(NULL);
+    CHECK(wall_time >= 0 && (uint64_t)wall_time <= UINT32_MAX);
+    uint32_t now = (uint32_t)wall_time;
+    CHECK(pcomm_msg_pack_direct_text(now, sender.user_id, "local mailbox control", &plain, &plain_length) == 0);
+    CHECK(pcomm_ratchet_send(&sender_db, &sender, recipient.user_id, "", plain, plain_length) == 0);
+    CHECK(pcomm_ratchet_outbox_next(&sender_db, wall_time, &outgoing) == 1);
+    CHECK(strcmp(outgoing.peer, recipient.user_id) == 0 && outgoing.sealed_len <= UINT32_MAX);
+    CHECK(pcomm_open_seal(recipient.privkey, outgoing.sealed, outgoing.sealed_len, &offer, &offer_length) == 0);
+    CHECK(offer_length > 5 && pcomm_ratchet_is_packet(offer, offer_length) && offer[5] == 1);
+    CHECK(queue_test_value(&sender_db, "SELECT count(*) FROM messages WHERE direction=1", NULL) == 1);
+    CHECK(queue_test_value(&recipient_db, "SELECT count(*) FROM messages", NULL) == 0);
+    CHECK(local_mailbox_key(recipient.user_id, now / (6u*3600u), key) == 0);
+    CHECK(pcomm_db_mailbox_put(&recipient_db, key, outgoing.sealed, (uint32_t)outgoing.sealed_len, wall_time) == 0);
+    CHECK(queue_test_value(&recipient_db, "SELECT count(*) FROM mailbox_items", NULL) == 1);
+    CHECK(pcomm_hidden_start(&cfg, &recipient, &recipient_db) == 0);
+    uint64_t deadline = now_ms() + 3000;
+    do {
+        CHECK(net_tracked_socket_count() == 0);
+        if (queue_test_value(&recipient_db, "SELECT count(*) FROM mailbox_items", NULL) == 0 &&
+            queue_test_value(&recipient_db,
+                "SELECT count(*) FROM ratchet_sessions WHERE peer=? AND context='' AND state=2 AND initiator=0",
+                sender.user_id) == 1 &&
+            queue_test_value(&recipient_db, "SELECT count(*) FROM ratchet_outbox WHERE peer=? AND kind=2",
+                sender.user_id) == 1) {
+            received = 1;
+            break;
+        }
+        poll(NULL, 0, 10);
+    } while (now_ms() < deadline);
+    CHECK(received);
+    uint64_t stopping = now_ms();
+    pcomm_hidden_request_stop();
+    pcomm_hidden_stop();
+    CHECK(now_ms() - stopping < 2000 && !pcomm_shutdown_requested());
+    CHECK(net_tracked_socket_count() == 0);
+    CHECK(queue_test_value(&recipient_db, "SELECT count(*) FROM messages", NULL) == 0);
+    CHECK(queue_test_value(&recipient_db, "SELECT count(*) FROM conversations", NULL) == 0);
+    CHECK(queue_test_value(&recipient_db, "SELECT count(*) FROM ratchet_pending", NULL) == 0);
+    CHECK(queue_test_value(&recipient_db, "SELECT count(*) FROM ratchet_outbox", NULL) == 1);
+    CHECK(queue_test_value(&recipient_db, "SELECT count(*) FROM contacts", NULL) == 0);
+    CHECK(queue_test_value(&recipient_db, "SELECT count(*) FROM dht_nodes", NULL) == 0);
+    CHECK(queue_test_value(&sender_db, "SELECT count(*) FROM messages", NULL) == 1);
+    CHECK(queue_test_value(&sender_db, "SELECT count(*) FROM ratchet_pending", NULL) == 1);
+    CHECK(queue_test_value(&sender_db, "SELECT count(*) FROM ratchet_outbox WHERE kind=1", NULL) == 1);
+    CHECK(db_close_checked(&recipient_db) == 0 && db_close_checked(&sender_db) == 0);
+done:
+    stop_all();
+    if (plain) OPENSSL_cleanse(plain, plain_length);
+    if (offer) OPENSSL_cleanse(offer, offer_length);
+    free(plain); free(offer);
+    pcomm_ratchet_outgoing_free(&outgoing);
+    pcomm_db_close(&recipient_db); pcomm_db_close(&sender_db);
+    OPENSSL_cleanse(&recipient, sizeof(recipient)); OPENSSL_cleanse(&sender, sizeof(sender));
     return ok;
 }
 
@@ -493,10 +738,12 @@ int main(int argc, char **argv) {
         const char *name;
         int (*run)(const char *);
     } tests[] = {
-        {"same-port idle, stalled-client, and buffered-stream restarts", test_repeated_start_stop},
+        {"same-port idle, stalled-client, stream, and paired-rendezvous restarts", test_repeated_start_stop},
         {"blocked TCP and UDP bootstrap shutdown", test_blocked_bootstrap_shutdown},
         {"local mesh stop interrupts stalled peer read", test_local_mesh_stop_interrupts_peer_read},
         {"partial-startup rollback and reuse", test_partial_startup_rollback},
+        {"HTTP ratchet queue admission and partial group failure", test_http_reports_ratchet_admission_failure},
+        {"local mailbox accepts ratchet control without discovery", test_local_mailbox_accepts_ratchet_offer},
     };
     size_t failures = 0;
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {

@@ -13,7 +13,6 @@
     } \
 } while (0)
 
-/* Deterministic transport: exercise real framing without platform sockets. */
 static const uint8_t *input;
 static size_t input_size, input_offset;
 static size_t recv_sizes[4];
@@ -201,7 +200,6 @@ static int test_receive_failures_and_stream_boundary(void) {
     CHECK(pcomm_recv_packet(1, &type, NULL, NULL, &payload_len) == -1);
     CHECK(payload_len == 0 && recv_calls == 0);
 
-    /* A stream reader consumes exactly one frame, leaving subsequent bytes. */
     CHECK(pcomm_recv_packet(1, &type, NULL, &payload, &payload_len) == 0);
     CHECK(payload_len == 3 && input_offset == PCOMM_HDR_LEN + 3);
     CHECK(input_size - input_offset == 1);

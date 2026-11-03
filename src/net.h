@@ -13,9 +13,6 @@ int net_sendall(int fd, const void *buf, size_t len);
 int net_recvall(int fd, void *buf, size_t len);
 bool net_addr_is_private(const void *addr, int family);
 
-/* Managed TCP sockets stay owned by their worker until net_close. Shutdown
- * interrupts blocking I/O without closing/reusing descriptors under a worker.
- */
 void net_shutdown(int fd);
 void net_shutdown_all(void);
 void net_close(int fd);

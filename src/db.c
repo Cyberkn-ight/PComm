@@ -1,3 +1,7 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "db.h"
 #include "mailbox_limits.h"
 #include <stdio.h>
@@ -44,6 +48,14 @@ int pcomm_db_open(pcomm_db_t *pdb, const char *data_dir) {
 
     if (sqlite3_open_v2(path, &pdb->db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         fprintf(stderr, "Failed to open sqlite db: %s\n", sqlite3_errmsg(pdb->db));
+        sqlite3_close(pdb->db);
+        pdb->db = NULL;
+        return -1;
+    }
+    if (!sqlite3_db_mutex(pdb->db)) {
+        fprintf(stderr, "SQLite serialized mode is required\n");
+        sqlite3_close(pdb->db);
+        pdb->db = NULL;
         return -1;
     }
     sqlite3_busy_timeout(pdb->db, 2000);
@@ -67,8 +79,35 @@ void pcomm_db_close(pcomm_db_t *pdb) {
     pdb->replay_cache = NULL;
 }
 
+int pcomm_db_transaction(pcomm_db_t *pdb, int (*operation)(void *), void *arg) {
+    if (!pdb || !pdb->db || !operation) return -1;
+    sqlite3_mutex *mutex = sqlite3_db_mutex(pdb->db);
+    if (!mutex) return -1;
+    sqlite3_mutex_enter(mutex);
+    int result = -1;
+    int started = 0;
+    if (!sqlite3_get_autocommit(pdb->db) || exec_sql(pdb->db, "BEGIN IMMEDIATE;") != 0) goto done;
+    started = 1;
+    result = operation(arg);
+    if (result == 0) {
+        if (sqlite3_get_autocommit(pdb->db) || exec_sql(pdb->db, "COMMIT;") != 0) result = -1;
+        else started = 0;
+    }
+done:
+    if (started && !sqlite3_get_autocommit(pdb->db) && exec_sql(pdb->db, "ROLLBACK;") != 0) result = -1;
+    sqlite3_mutex_leave(mutex);
+    return result;
+}
+
 int pcomm_db_init_schema(pcomm_db_t *pdb) {
     if (!pdb || !pdb->db) return -1;
+
+    sqlite3_stmt *secure_delete = NULL;
+    if (sqlite3_prepare_v2(pdb->db, "PRAGMA secure_delete=ON;", -1, &secure_delete, NULL) != SQLITE_OK) return -1;
+    int secure = sqlite3_step(secure_delete) == SQLITE_ROW && sqlite3_column_int(secure_delete, 0) == 1 &&
+        sqlite3_step(secure_delete) == SQLITE_DONE;
+    int secure_rc = sqlite3_finalize(secure_delete);
+    if (!secure || secure_rc != SQLITE_OK) return -1;
 
     const char *sql =
         "CREATE TABLE IF NOT EXISTS contacts("
@@ -132,6 +171,12 @@ int pcomm_db_init_schema(pcomm_db_t *pdb) {
         ");";
 
     if (exec_sql(pdb->db, sql2) != 0) return -1;
+    if (exec_sql(pdb->db,
+        "CREATE TABLE IF NOT EXISTS descriptor_trust("
+        "owner BLOB NOT NULL CHECK(length(owner)=32),epoch INTEGER NOT NULL,"
+        "issued INTEGER NOT NULL,digest BLOB NOT NULL CHECK(length(digest)=32),"
+        "PRIMARY KEY(owner,epoch));"
+        "DELETE FROM descriptors WHERE length(blob)>512 OR substr(blob,1,4)!=X'50434432';") != 0) return -1;
 
     const char *sql3 =
         "CREATE TABLE IF NOT EXISTS settings("
@@ -148,6 +193,59 @@ int pcomm_db_init_schema(pcomm_db_t *pdb) {
         "CREATE INDEX IF NOT EXISTS idx_dht_nodes_seen ON dht_nodes(last_seen);";
 
     if (exec_sql(pdb->db, sql3) != 0) return -1;
+
+    const char *ratchet_sql =
+        "CREATE TABLE IF NOT EXISTS ratchet_sessions("
+        " peer TEXT NOT NULL,"
+        " context TEXT NOT NULL,"
+        " sid BLOB NOT NULL UNIQUE CHECK(length(sid)=16),"
+        " state INTEGER NOT NULL,"
+        " initiator INTEGER NOT NULL,"
+        " local_pub BLOB NOT NULL CHECK(length(local_pub)=32),"
+        " peer_pub BLOB NOT NULL CHECK(length(peer_pub)=32),"
+        " init_eph BLOB NOT NULL CHECK(length(init_eph)=32),"
+        " private_eph BLOB CHECK(private_eph IS NULL OR length(private_eph)=32),"
+        " response BLOB,"
+        " root_key BLOB CHECK(root_key IS NULL OR length(root_key)=32),"
+        " send_chain BLOB CHECK(send_chain IS NULL OR length(send_chain)=32),"
+        " recv_chain BLOB CHECK(recv_chain IS NULL OR length(recv_chain)=32),"
+        " send_n INTEGER NOT NULL DEFAULT 0,"
+        " recv_n INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY(peer,context)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS ratchet_pending("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " peer TEXT NOT NULL,"
+        " context TEXT NOT NULL,"
+        " plain BLOB NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_ratchet_pending_peer_context ON ratchet_pending(peer,context,id);"
+        "CREATE TABLE IF NOT EXISTS ratchet_outbox("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " peer TEXT NOT NULL,"
+        " context TEXT NOT NULL,"
+        " sid BLOB NOT NULL,"
+        " kind INTEGER NOT NULL,"
+        " n INTEGER NOT NULL,"
+        " wire BLOB NOT NULL,"
+        " digest BLOB,"
+        " next_attempt INTEGER NOT NULL DEFAULT 0,"
+        " UNIQUE(sid,kind,n)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_ratchet_outbox_due ON ratchet_outbox(next_attempt,id);"
+        "CREATE TABLE IF NOT EXISTS ratchet_skipped("
+        " sid BLOB NOT NULL,"
+        " n INTEGER NOT NULL,"
+        " key BLOB NOT NULL CHECK(length(key)=32),"
+        " PRIMARY KEY(sid,n)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS ratchet_received("
+        " sid BLOB NOT NULL,"
+        " n INTEGER NOT NULL,"
+        " digest BLOB NOT NULL CHECK(length(digest)=32),"
+        " PRIMARY KEY(sid,n)"
+        ");";
+    if (exec_sql(pdb->db, ratchet_sql) != 0) return -1;
 
     return 0;
 }
@@ -232,65 +330,76 @@ static uint64_t to_be64(uint64_t x) {
     return y;
 }
 
-int64_t pcomm_db_get_or_create_direct_conv(pcomm_db_t *pdb, const char *peer_user_id) {
-    if (!pdb || !pdb->db) return -1;
-
-    const char *find_sql =
+static int64_t get_or_create_conversation(pcomm_db_t *pdb, const char *identifier,
+                                           const char *title, int group) {
+    if (!pdb || !pdb->db || !identifier) return -1;
+    sqlite3_mutex *mutex = sqlite3_db_mutex(pdb->db);
+    if (!mutex) return -1;
+    sqlite3_mutex_enter(mutex);
+    sqlite3_stmt *st = NULL;
+    int64_t result = -1;
+    int savepoint = 0, outermost = 0;
+    const char *find_sql = group ?
+        "SELECT id FROM conversations WHERE type='group' AND uuid=? LIMIT 1;" :
         "SELECT c.id FROM conversations c "
         "JOIN participants p ON p.conversation_id=c.id "
         "WHERE c.type='direct' AND p.user_id=? LIMIT 1;";
-
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(pdb->db, find_sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_text(st, 1, peer_user_id, -1, SQLITE_TRANSIENT);
-
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        int64_t id = sqlite3_column_int64(st, 0);
-        sqlite3_finalize(st);
-        return id;
+    if (sqlite3_prepare_v2(pdb->db, find_sql, -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(st, 1, identifier, -1, SQLITE_TRANSIENT) != SQLITE_OK) goto done;
+    int step = sqlite3_step(st);
+    if (step == SQLITE_ROW) {
+        result = sqlite3_column_int64(st, 0);
+        goto done;
     }
+    if (step != SQLITE_DONE) goto done;
     sqlite3_finalize(st);
-
-    exec_sql(pdb->db, "BEGIN;");
-
-    sqlite3_stmt *ins = NULL;
+    st = NULL;
+    char direct_uuid[256];
+    if (!group) {
+        int written = snprintf(direct_uuid, sizeof(direct_uuid), "direct:%s", identifier);
+        if (written < 0 || (size_t)written >= sizeof(direct_uuid)) goto done;
+    }
+    outermost = sqlite3_get_autocommit(pdb->db);
+    if (exec_sql(pdb->db, "SAVEPOINT pcomm_conversation;") != 0) goto done;
+    savepoint = 1;
     if (sqlite3_prepare_v2(pdb->db,
-        "INSERT INTO conversations(uuid,type,title,created_at) VALUES(?, 'direct', NULL, ?);",
-        -1, &ins, NULL) != SQLITE_OK) {
-        exec_sql(pdb->db, "ROLLBACK;");
-        return -1;
-    }
-    char uuid[256];
-    snprintf(uuid, sizeof(uuid), "direct:%s", peer_user_id);
-    sqlite3_bind_text(ins, 1, uuid, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(ins, 2, now_unix(pdb->db));
-    if (sqlite3_step(ins) != SQLITE_DONE) {
-        sqlite3_finalize(ins);
-        exec_sql(pdb->db, "ROLLBACK;");
-        return -1;
-    }
-    sqlite3_finalize(ins);
-
+        "INSERT INTO conversations(uuid,type,title,created_at) VALUES(?1,?2,?3,strftime('%s','now'));",
+        -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(st, 1, group ? identifier : direct_uuid, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, group ? "group" : "direct", -1, SQLITE_STATIC) != SQLITE_OK) goto done;
+    int bind_title = group ? sqlite3_bind_text(st, 3, title ? title : "", -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 3);
+    if (bind_title != SQLITE_OK || sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(pdb->db) != 1) goto done;
     int64_t conv_id = sqlite3_last_insert_rowid(pdb->db);
-
-    sqlite3_stmt *p1 = NULL;
-    if (sqlite3_prepare_v2(pdb->db,
-        "INSERT INTO participants(conversation_id,user_id,role) VALUES(?,?, 'member');",
-        -1, &p1, NULL) != SQLITE_OK) {
-        exec_sql(pdb->db, "ROLLBACK;");
-        return -1;
+    sqlite3_finalize(st);
+    st = NULL;
+    if (!group) {
+        if (sqlite3_prepare_v2(pdb->db,
+            "INSERT INTO participants(conversation_id,user_id,role) VALUES(?1,?2,'member');",
+            -1, &st, NULL) != SQLITE_OK ||
+            sqlite3_bind_int64(st, 1, conv_id) != SQLITE_OK ||
+            sqlite3_bind_text(st, 2, identifier, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(pdb->db) != 1) goto done;
+        sqlite3_finalize(st);
+        st = NULL;
     }
-    sqlite3_bind_int64(p1, 1, conv_id);
-    sqlite3_bind_text(p1, 2, peer_user_id, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(p1) != SQLITE_DONE) {
-        sqlite3_finalize(p1);
-        exec_sql(pdb->db, "ROLLBACK;");
-        return -1;
+    if (exec_sql(pdb->db, "RELEASE pcomm_conversation;") != 0) goto done;
+    savepoint = 0;
+    result = conv_id;
+done:
+    sqlite3_finalize(st);
+    if (savepoint && !sqlite3_get_autocommit(pdb->db)) {
+        if (outermost) exec_sql(pdb->db, "ROLLBACK;");
+        else {
+            exec_sql(pdb->db, "ROLLBACK TO pcomm_conversation;");
+            exec_sql(pdb->db, "RELEASE pcomm_conversation;");
+        }
     }
-    sqlite3_finalize(p1);
+    sqlite3_mutex_leave(mutex);
+    return result;
+}
 
-    exec_sql(pdb->db, "COMMIT;");
-    return conv_id;
+int64_t pcomm_db_get_or_create_direct_conv(pcomm_db_t *pdb, const char *peer_user_id) {
+    return get_or_create_conversation(pdb, peer_user_id, NULL, 0);
 }
 
 int pcomm_db_insert_message(pcomm_db_t *pdb, int64_t conv_id, int direction, const char *peer_user_id,
@@ -332,40 +441,7 @@ int pcomm_db_add_participant(pcomm_db_t *pdb, int64_t conv_id, const char *user_
 }
 
 int64_t pcomm_db_get_or_create_group_conv(pcomm_db_t *pdb, const char *uuid, const char *title) {
-    if (!pdb || !pdb->db || !uuid) return -1;
-
-    const char *find_sql = "SELECT id FROM conversations WHERE type='group' AND uuid=? LIMIT 1;";
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(pdb->db, find_sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_text(st, 1, uuid, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st) == SQLITE_ROW) {
-        int64_t id = sqlite3_column_int64(st, 0);
-        sqlite3_finalize(st);
-        return id;
-    }
-    sqlite3_finalize(st);
-
-    exec_sql(pdb->db, "BEGIN;");
-
-    sqlite3_stmt *ins = NULL;
-    if (sqlite3_prepare_v2(pdb->db,
-        "INSERT INTO conversations(uuid,type,title,created_at) VALUES(?, 'group', ?, ?);",
-        -1, &ins, NULL) != SQLITE_OK) {
-        exec_sql(pdb->db, "ROLLBACK;");
-        return -1;
-    }
-    sqlite3_bind_text(ins, 1, uuid, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(ins, 2, title ? title : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(ins, 3, now_unix(pdb->db));
-    if (sqlite3_step(ins) != SQLITE_DONE) {
-        sqlite3_finalize(ins);
-        exec_sql(pdb->db, "ROLLBACK;");
-        return -1;
-    }
-    sqlite3_finalize(ins);
-    int64_t conv_id = sqlite3_last_insert_rowid(pdb->db);
-    exec_sql(pdb->db, "COMMIT;");
-    return conv_id;
+    return get_or_create_conversation(pdb, uuid, title, 1);
 }
 
 int pcomm_db_get_conversation_uuid(pcomm_db_t *pdb, int64_t conv_id, char *uuid_out, size_t uuid_cap, char *type_out, size_t type_cap) {
@@ -440,9 +516,6 @@ int pcomm_db_mailbox_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *
     if (!pdb || !pdb->db || !key || !blob || blob_len == 0 ||
         blob_len > PCOMM_MAILBOX_MAX_BLOB_LEN || received_unix < 0) return -1;
 
-    /* Quota checks and insertion are one SQLite statement, so concurrent writers
-     * cannot both observe a free slot and exceed a row or byte limit.
-     */
     const char *sql =
         "INSERT INTO mailbox_items(mkey,ts_unix,blob) SELECT ?1,?2,?3 WHERE "
         "(SELECT count(*) FROM mailbox_items WHERE mkey=?1)<?4 AND "
@@ -487,9 +560,6 @@ int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], int6
     uint16_t count = 0;
     sqlite3_int64 ids[PCOMM_MAILBOX_MAX_ITEMS];
 
-    /* SAVEPOINT also works if the caller already has a transaction. It cannot
-     * commit an unrelated outer transaction on this shared connection.
-     */
     if (sqlite3_exec(pdb->db, "SAVEPOINT pcomm_mailbox_read;", NULL, NULL, NULL) != SQLITE_OK) goto done;
     savepoint = 1;
     if (mailbox_prune_locked(pdb->db, now_unix) != 0) goto done;
@@ -513,7 +583,7 @@ int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], int6
         memcpy(buf + off, &idn, 8); off += 8;
         memcpy(buf + off, &tsn, 4); off += 4;
         memcpy(buf + off, &ln, 4); off += 4;
-        /* SQLite's blob pointer expires on the next step/finalize. */
+
         memcpy(buf + off, blob, (size_t)blen); off += (uint32_t)blen;
         count++;
     }
@@ -558,19 +628,80 @@ done:
 }
 
 int pcomm_db_desc_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *blob, uint32_t blob_len, int64_t expires_unix, int64_t ts_unix) {
-    if (!pdb || !pdb->db || !key || !blob) return -1;
+    if (!pdb || !pdb->db || !key || !blob || !blob_len || blob_len > 2147483647u) return -1;
+    sqlite3_mutex *mutex = sqlite3_db_mutex(pdb->db);
+    if (!mutex) return -1;
+    sqlite3_mutex_enter(mutex);
     const char *sql =
         "INSERT INTO descriptors(dkey,ts_unix,expires_unix,blob) VALUES(?,?,?,?) "
-        "ON CONFLICT(dkey) DO UPDATE SET ts_unix=excluded.ts_unix, expires_unix=excluded.expires_unix, blob=excluded.blob;";
+        "ON CONFLICT(dkey) DO UPDATE SET ts_unix=excluded.ts_unix, expires_unix=excluded.expires_unix, blob=excluded.blob "
+        "WHERE excluded.ts_unix>descriptors.ts_unix OR (excluded.ts_unix=descriptors.ts_unix "
+        "AND excluded.blob=descriptors.blob AND excluded.expires_unix=descriptors.expires_unix);";
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK) return -1;
-    sqlite3_bind_blob(st, 1, key, 32, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(st, 2, ts_unix);
-    sqlite3_bind_int64(st, 3, expires_unix);
-    sqlite3_bind_blob(st, 4, blob, (int)blob_len, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(st);
-    sqlite3_finalize(st);
-    return (rc == SQLITE_DONE) ? 0 : -1;
+    int result = -1;
+    if (sqlite3_prepare_v2(pdb->db, sql, -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_blob(st, 1, key, 32, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 2, ts_unix) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 3, expires_unix) != SQLITE_OK ||
+        sqlite3_bind_blob(st, 4, blob, (int)blob_len, SQLITE_TRANSIENT) != SQLITE_OK) goto done;
+    if (sqlite3_step(st) == SQLITE_DONE) result = sqlite3_changes(pdb->db) ? 0 : 1;
+done:
+    if (sqlite3_finalize(st) != SQLITE_OK) result = -1;
+    sqlite3_mutex_leave(mutex);
+    return result;
+}
+
+typedef struct {
+    pcomm_db_t *db;
+    const uint8_t *owner, *digest;
+    uint32_t epoch, issued;
+    int result;
+} descriptor_trust_op_t;
+
+static int descriptor_trust_op(void *arg) {
+    descriptor_trust_op_t *op = arg;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(op->db->db, "SELECT max(epoch) FROM descriptor_trust WHERE owner=?", -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_blob(st, 1, op->owner, 32, SQLITE_TRANSIENT) != SQLITE_OK || sqlite3_step(st) != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    int too_old = sqlite3_column_type(st, 0) != SQLITE_NULL &&
+        (uint64_t)op->epoch+1 < (uint64_t)sqlite3_column_int64(st, 0);
+    if (sqlite3_finalize(st) != SQLITE_OK) return -1;
+    st = NULL;
+    if (too_old) { op->result = 1; return 0; }
+    const char *sql = "INSERT INTO descriptor_trust(owner,epoch,issued,digest) VALUES(?,?,?,?) "
+        "ON CONFLICT(owner,epoch) DO UPDATE SET issued=excluded.issued,digest=excluded.digest "
+        "WHERE excluded.issued>descriptor_trust.issued OR (excluded.issued=descriptor_trust.issued "
+        "AND excluded.digest=descriptor_trust.digest);";
+    int result = -1;
+    if (sqlite3_prepare_v2(op->db->db, sql, -1, &st, NULL) != SQLITE_OK ||
+        sqlite3_bind_blob(st, 1, op->owner, 32, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 2, op->epoch) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 3, op->issued) != SQLITE_OK ||
+        sqlite3_bind_blob(st, 4, op->digest, 32, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE) goto done;
+    op->result = sqlite3_changes(op->db->db) ? 0 : 1;
+    if (sqlite3_finalize(st) != SQLITE_OK) { st = NULL; goto done; }
+    st = NULL;
+    if (op->result == 0) {
+        if (sqlite3_prepare_v2(op->db->db, "DELETE FROM descriptor_trust WHERE owner=? AND epoch<?", -1, &st, NULL) != SQLITE_OK ||
+            sqlite3_bind_blob(st, 1, op->owner, 32, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_int64(st, 2, op->epoch > 0 ? op->epoch-1 : 0) != SQLITE_OK ||
+            sqlite3_step(st) != SQLITE_DONE) goto done;
+    }
+    result = 0;
+done:
+    if (sqlite3_finalize(st) != SQLITE_OK) result = -1;
+    return result;
+}
+
+int pcomm_db_descriptor_trust(pcomm_db_t *pdb, const uint8_t owner[32], uint32_t epoch,
+                               uint32_t issued, const uint8_t digest[32]) {
+    if (!pdb || !pdb->db || !owner || !digest) return -1;
+    descriptor_trust_op_t op = {pdb, owner, digest, epoch, issued, -1};
+    return pcomm_db_transaction(pdb, descriptor_trust_op, &op) == 0 ? op.result : -1;
 }
 
 int pcomm_db_desc_get(pcomm_db_t *pdb, const uint8_t key[32], uint8_t **blob_out, uint32_t *blob_len_out) {

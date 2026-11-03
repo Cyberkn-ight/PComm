@@ -4,6 +4,15 @@ project(PComm C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+find_path(SODIUM_INCLUDE_DIR NAMES sodium.h)
+find_library(SODIUM_LIBRARY NAMES sodium libsodium)
+if(NOT SODIUM_INCLUDE_DIR OR NOT SODIUM_LIBRARY)
+    message(FATAL_ERROR "libsodium 1.0.21 or newer is required")
+endif()
+add_library(pcomm_sodium UNKNOWN IMPORTED)
+set_target_properties(pcomm_sodium PROPERTIES IMPORTED_LOCATION "${SODIUM_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${SODIUM_INCLUDE_DIR}")
+
 add_executable(pcomm
     src/main.c
     src/config.c
@@ -11,6 +20,11 @@ add_executable(pcomm
     src/base32.c
     src/identity.c
     src/crypto.c
+    src/sign.c
+    src/descriptor.c
+    src/directory.c
+    src/ratchet_crypto.c
+    src/ratchet.c
     src/bencode.c
     src/dht.c
     src/cell.c
@@ -35,7 +49,7 @@ add_executable(pcomm
 
 target_include_directories(pcomm PRIVATE src)
 
-target_link_libraries(pcomm PRIVATE sqlite3 ssl crypto pthread)
+target_link_libraries(pcomm PRIVATE sqlite3 ssl crypto pthread pcomm_sodium)
 
 if(WIN32)
     target_link_libraries(pcomm PRIVATE ws2_32)
@@ -53,6 +67,10 @@ if(BUILD_TESTING)
         src/receive.c
         src/replay.c
         src/crypto.c
+        src/ratchet_crypto.c
+        src/ratchet.c
+        src/identity.c
+        src/base32.c
         src/msg.c
         src/db.c
     )
@@ -112,8 +130,50 @@ if(BUILD_TESTING)
     target_include_directories(test_lifecycle PRIVATE src)
     target_link_libraries(test_lifecycle PRIVATE pthread)
     add_test(NAME lifecycle COMMAND test_lifecycle)
+    add_executable(test_ratchet_crypto tests/test_ratchet_crypto.c src/ratchet_crypto.c src/crypto.c)
+    target_include_directories(test_ratchet_crypto PRIVATE src)
+    target_link_libraries(test_ratchet_crypto PRIVATE crypto)
+    add_test(NAME ratchet_crypto COMMAND test_ratchet_crypto)
+
+    set(PCOMM_RATCHET_TEST_SOURCES src/ratchet.c src/ratchet_crypto.c src/crypto.c
+        src/identity.c src/base32.c src/db.c src/msg.c src/replay.c)
+    add_executable(test_ratchet tests/test_ratchet.c ${PCOMM_RATCHET_TEST_SOURCES})
+    add_executable(test_ratchet_receive tests/test_ratchet_receive.c src/receive.c ${PCOMM_RATCHET_TEST_SOURCES})
+    foreach(ratchet_test IN ITEMS test_ratchet test_ratchet_receive)
+        target_include_directories(${ratchet_test} PRIVATE src)
+        target_link_libraries(${ratchet_test} PRIVATE sqlite3 crypto pthread)
+        if(WIN32)
+            target_link_libraries(${ratchet_test} PRIVATE ws2_32)
+        endif()
+    endforeach()
+    add_test(NAME ratchet COMMAND test_ratchet)
+    add_test(NAME ratchet_receive COMMAND test_ratchet_receive)
+    add_executable(test_config tests/test_config.c src/config.c)
+    target_include_directories(test_config PRIVATE src)
+    if(WIN32)
+        target_link_libraries(test_config PRIVATE ws2_32)
+    endif()
+    add_test(NAME config COMMAND test_config)
+
+    add_executable(test_sign tests/test_sign.c src/sign.c)
+    target_include_directories(test_sign PRIVATE src)
+    target_link_libraries(test_sign PRIVATE crypto pthread pcomm_sodium)
+    add_test(NAME sign COMMAND test_sign)
+
+    add_executable(test_descriptor tests/test_descriptor.c src/descriptor.c src/sign.c
+        src/crypto.c src/identity.c src/base32.c)
+    target_include_directories(test_descriptor PRIVATE src)
+    target_link_libraries(test_descriptor PRIVATE crypto pthread pcomm_sodium)
+    if(WIN32)
+        target_link_libraries(test_descriptor PRIVATE ws2_32)
+    endif()
+    add_test(NAME descriptor COMMAND test_descriptor)
+    add_executable(test_directory tests/test_directory.c src/directory.c src/sign.c src/crypto.c)
+    target_include_directories(test_directory PRIVATE src)
+    target_link_libraries(test_directory PRIVATE crypto pthread pcomm_sodium)
+    add_test(NAME directory COMMAND test_directory)
     set_tests_properties(replay_cache receive_replay mailbox_guard mailbox_db proto_limits
-        crypto msg db bencode lifecycle PROPERTIES TIMEOUT 30)
+        crypto msg db bencode lifecycle ratchet_crypto ratchet ratchet_receive config sign descriptor directory PROPERTIES TIMEOUT 30)
 
     if(UNIX)
         add_executable(test_net_shutdown tests/test_net_shutdown.c src/net.c src/lifecycle.c)
@@ -125,8 +185,13 @@ if(BUILD_TESTING)
         list(REMOVE_ITEM PCOMM_SERVICE_SOURCES src/main.c)
         add_executable(test_services_shutdown tests/test_services_shutdown.c ${PCOMM_SERVICE_SOURCES})
         target_include_directories(test_services_shutdown PRIVATE src)
-        target_link_libraries(test_services_shutdown PRIVATE sqlite3 ssl crypto pthread)
+        target_link_libraries(test_services_shutdown PRIVATE sqlite3 ssl crypto pthread pcomm_sodium)
         add_test(NAME services_shutdown COMMAND test_services_shutdown "${CMAKE_CURRENT_SOURCE_DIR}/ui")
+        add_executable(test_relay_descriptor tests/test_relay_descriptor.c ${PCOMM_SERVICE_SOURCES})
+        target_include_directories(test_relay_descriptor PRIVATE src)
+        target_link_libraries(test_relay_descriptor PRIVATE sqlite3 ssl crypto pthread pcomm_sodium)
+        add_test(NAME relay_descriptor COMMAND test_relay_descriptor)
+        set_tests_properties(relay_descriptor PROPERTIES TIMEOUT 30)
 
         add_executable(test_process_shutdown tests/test_process_shutdown.c)
         target_link_libraries(test_process_shutdown PRIVATE sqlite3)
@@ -134,6 +199,25 @@ if(BUILD_TESTING)
         add_test(NAME process_shutdown COMMAND test_process_shutdown
             "$<TARGET_FILE:pcomm>" "${CMAKE_CURRENT_SOURCE_DIR}/ui")
         set_tests_properties(net_shutdown services_shutdown process_shutdown PROPERTIES TIMEOUT 30)
+
+        add_executable(test_process_ratchet tests/test_process_ratchet.c src/identity.c src/base32.c)
+        target_include_directories(test_process_ratchet PRIVATE src)
+        target_link_libraries(test_process_ratchet PRIVATE sqlite3 crypto)
+        add_dependencies(test_process_ratchet pcomm)
+        add_test(NAME process_ratchet COMMAND test_process_ratchet
+            "$<TARGET_FILE:pcomm>" "${CMAKE_CURRENT_SOURCE_DIR}/ui")
+        set_tests_properties(process_ratchet PROPERTIES TIMEOUT 95)
+        add_test(NAME process_bootstrap COMMAND test_process_ratchet
+            "$<TARGET_FILE:pcomm>" "${CMAKE_CURRENT_SOURCE_DIR}/ui" --bootstrap-only)
+        set_tests_properties(process_bootstrap PROPERTIES TIMEOUT 95)
+
+        add_executable(test_dht_bootstrap tests/test_dht_bootstrap.c src/dht.c src/bencode.c
+            src/config.c src/crypto.c src/net.c src/lifecycle.c src/db.c src/replay.c
+            src/identity.c src/base32.c src/sign.c)
+        target_include_directories(test_dht_bootstrap PRIVATE src)
+        target_link_libraries(test_dht_bootstrap PRIVATE sqlite3 crypto pthread pcomm_sodium)
+        add_test(NAME dht_bootstrap COMMAND test_dht_bootstrap)
+        set_tests_properties(dht_bootstrap PROPERTIES TIMEOUT 30)
     endif()
 
     add_custom_target(check
@@ -143,9 +227,10 @@ if(BUILD_TESTING)
         VERBATIM
         USES_TERMINAL)
     add_dependencies(check test_replay_cache test_receive test_mailbox_guard test_mailbox_db
-        test_proto_limits test_crypto test_msg test_db test_bencode test_lifecycle)
+        test_proto_limits test_crypto test_msg test_db test_bencode test_lifecycle
+        test_ratchet_crypto test_ratchet test_ratchet_receive test_config test_sign test_descriptor test_directory)
     if(UNIX)
-        add_dependencies(check test_net_shutdown test_services_shutdown test_process_shutdown)
+        add_dependencies(check test_net_shutdown test_services_shutdown test_relay_descriptor test_process_shutdown test_process_ratchet test_dht_bootstrap)
     endif()
 endif()
 

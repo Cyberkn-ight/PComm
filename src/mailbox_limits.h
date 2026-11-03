@@ -3,9 +3,6 @@
 
 #include <stdint.h>
 
-/* Keep each envelope and response batch within the current single-cell RPC
- * transport (4096 bytes, including up to three 28-byte onion layers).
- */
 #define PCOMM_MAILBOX_MAX_BLOB_LEN 3072u
 #define PCOMM_MAILBOX_RESPONSE_MAX_BYTES 3800u
 #define PCOMM_MAILBOX_MAX_ITEMS 100u

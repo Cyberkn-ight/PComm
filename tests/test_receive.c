@@ -105,7 +105,6 @@ static int test_shared_delivery_and_distinct_envelopes(void) {
     CHECK(make_direct(&fixture, "same plaintext", &second, &second_len) == 0);
     CHECK(sealed_len != second_len || memcmp(sealed, second, sealed_len) != 0);
 
-    /* Mailbox, rendezvous, and direct delivery share this receiver and cache. */
     CHECK(pcomm_receive_sealed(&fixture.db, &fixture.recipient, sealed, sealed_len, 100) == 0);
     CHECK(pcomm_receive_sealed(&fixture.db, &fixture.recipient, sealed, sealed_len, 200) == 1);
     CHECK(pcomm_receive_sealed(&fixture.db, &fixture.recipient, sealed, sealed_len, 0) == 1);
@@ -143,7 +142,6 @@ static int test_invalid_messages_do_not_poison_cache(void) {
     CHECK(sql_value(&fixture, "SELECT count(*) FROM messages;") == 0);
     CHECK(pcomm_receive_sealed(&fixture.db, &fixture.recipient, sealed, sealed_len, 10) == 0);
 
-    /* Authenticated but malformed plaintext must not evict the accepted tag. */
     CHECK(pcomm_seal_for_recipient(fixture.recipient.pubkey, invalid_plain, sizeof(invalid_plain),
                                     &malformed, &malformed_len) == 0);
     CHECK(pcomm_receive_sealed(&fixture.db, &fixture.recipient, malformed, malformed_len, 10) == -1);
@@ -174,9 +172,6 @@ static int test_equivalent_x25519_envelopes_are_replays(void) {
     memcpy(high_bit_alias, sealed, sealed_len);
     memcpy(reciprocal_alias, sealed, sealed_len);
 
-    /* RFC 7748 ignores this encoded u-coordinate bit. A canonical reciprocal
-     * coordinate can also yield the same X25519 shared secret after clamping.
-     */
     high_bit_alias[31] ^= 0x80;
     context = BN_CTX_new();
     coordinate = BN_lebin2bn(sealed, 32, NULL);

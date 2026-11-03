@@ -16,6 +16,8 @@ void pcomm_db_close(pcomm_db_t *pdb);
 
 int pcomm_db_init_schema(pcomm_db_t *pdb);
 
+int pcomm_db_transaction(pcomm_db_t *pdb, int (*operation)(void *), void *arg);
+
 int pcomm_db_upsert_contact(pcomm_db_t *pdb, const char *user_id, const char *host, uint16_t port,
                             const uint8_t pubkey[32], int is_relay);
 int pcomm_db_get_contact(pcomm_db_t *pdb, const char *user_id, char *host_out, size_t host_cap,
@@ -35,9 +37,6 @@ int pcomm_db_get_conversation_uuid(pcomm_db_t *pdb, int64_t conv_id,
                                   char *type_out, size_t type_cap);
 int pcomm_db_list_group_participants(pcomm_db_t *pdb, int64_t conv_id, char ***ids_out, int *count_out);
 
-/* Mailbox timestamps are the relay's receipt time, never sender-provided time.
- * PUT returns 0 when stored, 1 when a quota is full, and -1 on invalid input/error.
- */
 int pcomm_db_mailbox_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *blob, uint32_t blob_len, int64_t received_unix);
 int pcomm_db_mailbox_prune(pcomm_db_t *pdb, int64_t now_unix);
 int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], int64_t now_unix,
@@ -45,6 +44,8 @@ int pcomm_db_mailbox_get_and_delete(pcomm_db_t *pdb, const uint8_t key[32], int6
 int pcomm_db_desc_put(pcomm_db_t *pdb, const uint8_t key[32], const uint8_t *blob, uint32_t blob_len,
                       int64_t expires_unix, int64_t ts_unix);
 int pcomm_db_desc_get(pcomm_db_t *pdb, const uint8_t key[32], uint8_t **blob_out, uint32_t *blob_len_out);
+int pcomm_db_descriptor_trust(pcomm_db_t *pdb, const uint8_t owner[32], uint32_t epoch,
+                               uint32_t issued, const uint8_t digest[32]);
 
 int pcomm_db_kv_set(pcomm_db_t *pdb, const char *key, const char *value);
 int pcomm_db_kv_get(pcomm_db_t *pdb, const char *key, char *value_out, size_t value_cap);

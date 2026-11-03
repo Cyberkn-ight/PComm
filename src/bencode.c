@@ -109,9 +109,7 @@ static int parse_int(const uint8_t *buf, size_t len, size_t *pos, benc_t **out) 
     int neg = 0;
     if (buf[*pos] == '-') { neg = 1; (*pos)++; }
     if (*pos >= len || !isdigit(buf[*pos])) return -1;
-    /* Accumulate unsigned magnitude so INT64_MIN never overflows signed C
-     * arithmetic. The public node representation is limited to int64_t.
-     */
+
     if (buf[*pos] == '0' && *pos + 1 < len && isdigit(buf[*pos + 1])) return -1;
     uint64_t magnitude = 0;
     uint64_t limit = (uint64_t)INT64_MAX + (uint64_t)neg;

@@ -86,7 +86,6 @@ int pcomm_replay_apply(pcomm_replay_cache_t *cache,
     if (!cache || !tag || !apply) return -1;
     if (pthread_mutex_lock(&cache->mutex) != 0) return -1;
 
-    /* A caller may have sampled the clock before another worker acquired us. */
     if (now_ms < cache->last_now_ms) now_ms = cache->last_now_ms;
     cache->last_now_ms = now_ms;
 

@@ -49,9 +49,7 @@ static int test_x25519_agreement(void) {
     uint8_t expected[32], from_alice[32], from_bob[32], basepoint[32] = {9};
     uint8_t equivalent_public[32];
     uint8_t zero_public[32] = {0};
-    /* RFC 7748, section 6.1, checked against the published test vector:
-     * https://www.rfc-editor.org/rfc/rfc7748#section-6.1
-     */
+
     CHECK(from_hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
                    alice_private, sizeof(alice_private)) == 0);
     CHECK(from_hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
@@ -66,7 +64,7 @@ static int test_x25519_agreement(void) {
     CHECK(pcomm_x25519_derive(bob_private, alice_public, from_bob) == 0);
     CHECK(memcmp(from_alice, from_bob, sizeof(from_alice)) == 0);
     CHECK(memcmp(from_alice, expected, sizeof(expected)) == 0);
-    /* RFC 7748 section 5 requires X25519 to ignore this encoded high bit. */
+
     memcpy(equivalent_public, bob_public, sizeof(equivalent_public));
     equivalent_public[31] ^= 0x80;
     CHECK(pcomm_x25519_derive(alice_private, equivalent_public, from_alice) == 0);
@@ -85,9 +83,7 @@ static int test_hkdf_vectors_and_separation(void) {
     memset(input, 0x0b, sizeof(input));
     for (size_t i = 0; i < sizeof(salt); i++) salt[i] = (uint8_t)i;
     for (size_t i = 0; i < sizeof(info); i++) info[i] = (uint8_t)(0xf0 + i);
-    /* RFC 5869, appendix A.1 (42 bytes exercises two expansion blocks):
-     * https://www.rfc-editor.org/rfc/rfc5869#appendix-A.1
-     */
+
     CHECK(from_hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
                    "34007208d5b887185865", expected, sizeof(expected)) == 0);
     CHECK(pcomm_hkdf_sha256(input, sizeof(input), salt, sizeof(salt), info, sizeof(info),
@@ -106,7 +102,6 @@ static int test_hkdf_vectors_and_separation(void) {
                             changed, sizeof(changed)) == 0);
     CHECK(memcmp(output, changed, sizeof(output)) != 0);
 
-    /* RFC 5869, appendix A.3: omitted salt/info and the default zero salt. */
     CHECK(from_hex("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"
                    "9d201395faa4b61a96c8", expected, sizeof(expected)) == 0);
     CHECK(pcomm_hkdf_sha256(input, sizeof(input), NULL, 0, NULL, 0,
@@ -128,9 +123,7 @@ static int test_aead_vector_and_authentication(void) {
     uint8_t cipher[CIPHER_LEN], opened[PLAIN_LEN + 1], altered[CIPHER_LEN];
     uint8_t short_buffer[CIPHER_LEN + 1];
     size_t cipher_len = sizeof(cipher), opened_len = PLAIN_LEN;
-    /* RFC 8439, section 2.8.2: ciphertext followed by its 16-byte tag.
-     * https://www.rfc-editor.org/rfc/rfc8439#section-2.8.2
-     */
+
     CHECK(from_hex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
                    key, sizeof(key)) == 0);
     CHECK(from_hex("070000004041424344454647", nonce, sizeof(nonce)) == 0);
@@ -249,7 +242,7 @@ static int test_randomized_seals_and_rejection(void) {
     altered = (uint8_t *)malloc(first_len);
     CHECK(altered != NULL);
     memcpy(altered, first, first_len);
-    memset(altered, 0, 32); /* An invalid low-order peer key, not a DH alias. */
+    memset(altered, 0, 32);
     CHECK(seal_rejected(private_key, altered, first_len));
     const size_t altered_offsets[] = {32, 44, first_len - 1};
     for (size_t i = 0; i < sizeof(altered_offsets) / sizeof(altered_offsets[0]); i++) {

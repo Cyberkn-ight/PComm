@@ -69,7 +69,6 @@ static uint32_t frame_make(uint8_t frame[FRAME_CAPACITY], uint32_t blob_len, uns
     return PUT_HEADER_LEN + blob_len;
 }
 
-/* Also verify the success-only announcement output on every attempt. */
 static int deposit(fixture_t *fixture, const char *ip, const uint8_t *frame,
                     uint32_t frame_len, uint64_t now_ms) {
     uint8_t infohash[20], unchanged[20];
@@ -317,7 +316,7 @@ static void *admission_worker(void *arg) {
     admission_worker_t *worker = (admission_worker_t *)arg;
     atomic_fetch_add_explicit(&worker->start->ready, 1, memory_order_release);
     while (!atomic_load_explicit(&worker->start->start, memory_order_acquire)) {
-        /* The test gate is released after all workers are ready. */
+
     }
     if (atomic_load_explicit(&worker->start->cancel, memory_order_acquire)) return NULL;
 
@@ -362,17 +361,17 @@ static int test_concurrent_admission(int independent_sources) {
     }
     if (ok) {
         while (atomic_load_explicit(&start.ready, memory_order_acquire) < created) {
-            /* Every successfully created worker enters this gate first. */
+
         }
     } else {
         atomic_store_explicit(&start.cancel, 1, memory_order_release);
     }
     atomic_store_explicit(&start.start, 1, memory_order_release);
-    /* Even partial creation failures release and join every created worker. */
+
     for (unsigned i = 0; i < created; i++) {
         if (pthread_join(threads[i], NULL) != 0) {
             fprintf(stderr, "Could not join admission test worker %u\n", i);
-            abort(); /* Do not free a database or stack still used by a worker. */
+            abort();
         }
         accepted += workers[i].accepted;
         rejected += workers[i].rejected;

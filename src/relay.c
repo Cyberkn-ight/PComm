@@ -12,6 +12,8 @@
 #include "mailbox.h"
 #include "mailbox_limits.h"
 #include "lifecycle.h"
+#include "descriptor.h"
+#include "directory.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -68,10 +70,6 @@ static int relay_stopping(const relay_state_t *st) {
     return atomic_load(&st->stopping) || pcomm_shutdown_requested();
 }
 
-/* Accepted and outbound descriptors stay owned by this handler. Stop only
- * interrupts them; closing/resetting under conn_mu prevents descriptor reuse
- * while another thread is taking a shutdown snapshot.
- */
 static void relay_track_outbound(conn_arg_t *conn, int fd, int downstream) {
     pthread_mutex_lock(&conn->st->conn_mu);
     if (downstream) conn->downstream_fd = fd;
@@ -100,7 +98,6 @@ static void relay_finish_connection(conn_arg_t *conn) {
 }
 
 static void put_u16(uint8_t *p, uint16_t v){ uint16_t n=htons(v); memcpy(p,&n,2); }
-static void put_u32(uint8_t *p, uint32_t v){ uint32_t n=htonl(v); memcpy(p,&n,4); }
 static uint16_t get_u16(const uint8_t *p){ uint16_t n; memcpy(&n,p,2); return ntohs(n); }
 static uint32_t get_u32(const uint8_t *p){ uint32_t n; memcpy(&n,p,4); return ntohl(n); }
 
@@ -207,37 +204,34 @@ static int ctrl_handle(relay_state_t *st, int fd, const char *peer_ip,
         memcpy(dkey, payload + off, 32); off += 32;
         uint32_t expires = get_u32(payload + off); off += 4;
         uint32_t bl = get_u32(payload + off); off += 4;
-        if (payload_len < off + bl) return 0;
-        int64_t now = (int64_t)time(NULL);
-        pcomm_db_desc_put(st->db, dkey, payload + off, bl, (int64_t)expires, now);
-        pcomm_dht_announce(infohash, st->cfg.relay_port);
-        return 0;
+        if (!bl || bl > PCOMM_DESCRIPTOR_MAX_BLOB || payload_len-off != bl) return 0;
+        time_t now = time(NULL);
+        pcomm_descriptor_t descriptor;
+        uint8_t expected_key[32], expected_hash[20];
+        if (now < 0 || (uint64_t)now > UINT32_MAX ||
+            pcomm_descriptor_parse(payload+off, bl, NULL, UINT32_MAX, (uint32_t)now, &descriptor) ||
+            pcomm_descriptor_keys(descriptor.owner, descriptor.epoch, expected_key, expected_hash) ||
+            CRYPTO_memcmp(dkey, expected_key, 32) || CRYPTO_memcmp(infohash, expected_hash, 20) ||
+            expires != descriptor.expires) return 0;
+        int stored = pcomm_db_desc_put(st->db, dkey, payload+off, bl, expires, descriptor.issued);
+        if (stored == 0) pcomm_dht_announce(infohash, st->cfg.relay_port);
+        return stored < 0 ? -1 : 0;
     }
 
     if (cmd == PCOMM_CTRL_DESC_GET) {
-        if (payload_len < off + 20 + 32) return 0;
-        off += 20;
-        uint8_t dkey[32];
-        memcpy(dkey, payload + off, 32);
-
+        uint8_t infohash[20], dkey[32], nonce[32];
+        if (pcomm_directory_parse_request(payload, payload_len, infohash, dkey, nonce)) return 0;
         uint8_t *blob = NULL; uint32_t bl = 0;
-        int ok = (pcomm_db_desc_get(st->db, dkey, &blob, &bl) == 0) ? 1 : 0;
-
-        uint32_t resp_len = 1 + 1 + 4 + (ok ? bl : 0);
-        uint8_t *resp = (uint8_t*)malloc(resp_len);
-        if (!resp) { free(blob); return -1; }
-        uint32_t ro = 0;
-        resp[ro++] = (uint8_t)PCOMM_CTRL_DESC_RESP;
-        resp[ro++] = (uint8_t)ok;
-        put_u32(resp + ro, ok ? bl : 0); ro += 4;
-        if (ok && bl) {
-            memcpy(resp + ro, blob, bl);
-            ro += bl;
+        if (pcomm_db_desc_get(st->db, dkey, &blob, &bl) != 0) { blob = NULL; bl = 0; }
+        if (bl > PCOMM_DESCRIPTOR_MAX_BLOB) {
+            free(blob); blob = NULL; bl = 0;
         }
+        uint8_t *resp = NULL; uint32_t resp_len = 0;
+        int rc = pcomm_directory_response(&st->id, nonce, dkey, blob, bl, &resp, &resp_len);
         free(blob);
-        pcomm_send_packet(fd, PCOMM_MSG_CTRL, NULL, resp, ro);
+        if (rc == 0) rc = pcomm_send_packet(fd, PCOMM_MSG_CTRL, NULL, resp, resp_len);
         free(resp);
-        return 0;
+        return rc;
     }
 
     if (cmd == PCOMM_CTRL_MB_PUT) {
@@ -745,7 +739,6 @@ static int cell_handle_exit_plain(relay_state_t *st, cell_conn_t *cc, const uint
         return 0;
     }
 
-
     if (rcmd == PCOMM_RELAY_ESTABLISH_INTRO) {
         if (bl < 1) return -1;
         uint8_t sl = body[0];
@@ -841,7 +834,6 @@ static int cell_handle_exit_plain(relay_state_t *st, cell_conn_t *cc, const uint
         cc_release(client);
         return 0;
     }
-
 
     if (rcmd == PCOMM_RELAY_EXTEND) {
         if (bl < 1 + 2 + 32) return -1;
@@ -1069,13 +1061,9 @@ done:
     if (cc->down_fd >= 0) relay_close_outbound(owner, cc->down_fd);
     drain_up_queue(cc);
 
-    /* cc_release owns stream buffers and queued items, including when another
-     * handler temporarily retains this connection through a registry lookup.
-     */
     cc_release(cc);
     return 0;
 }
-
 
 static void *handle_conn(void *arg) {
     conn_arg_t *ca = (conn_arg_t*)arg;
@@ -1194,9 +1182,7 @@ static void relay_interrupt_connections(relay_state_t *st) {
 static void *relay_thread(void *arg) {
     relay_state_t *st = (relay_state_t*)arg;
     while (!relay_stopping(st)) {
-        /* net_accept polls, so finished joinable workers are reaped even while
-         * the listener is idle, rather than accumulating until shutdown.
-         */
+
         relay_reap_connections(st, 0);
         char peer_ip[64] = {0};
         int cfd = net_accept(st->listen_fd, peer_ip, sizeof(peer_ip), NULL);
@@ -1204,9 +1190,7 @@ static void *relay_thread(void *arg) {
             int accept_error = errno;
             if (relay_stopping(st)) break;
             if (accept_error == EBADF || accept_error == EINVAL || accept_error == ENOTSOCK) break;
-            /* Aborted peers and temporary descriptor/memory pressure must not
-             * permanently stop an otherwise valid listener or spin on errors.
-             */
+
             if (accept_error != EAGAIN && accept_error != EWOULDBLOCK &&
                 accept_error != EINTR && pcomm_shutdown_wait(25) != 0) break;
             continue;
@@ -1247,7 +1231,7 @@ static void relay_dispose(relay_state_t *st) {
     if (st->listen_fd >= 0) net_shutdown(st->listen_fd);
     relay_interrupt_connections(st);
     if (st->accept_started) pthread_join(st->accept_thread, NULL);
-    /* No accept worker can add handlers after this point. */
+
     relay_interrupt_connections(st);
     relay_reap_connections(st, 1);
     if (st->maint_started) pthread_join(st->maint_thread, NULL);

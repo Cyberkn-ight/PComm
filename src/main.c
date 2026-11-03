@@ -17,7 +17,7 @@
 
 static volatile sig_atomic_t g_signal = 0;
 static void on_sig(int s) {
-    /* Mutexes, socket operations, and joins belong to normal thread context. */
+
     g_signal = s;
 }
 
@@ -83,9 +83,7 @@ int main(int argc, char **argv) {
     }
 
 shutdown:
-    /* Wake every provider before joining consumers, then release SQLite only
-     * after no worker or callback can touch it (including partial startup).
-     */
+
     pcomm_shutdown_request();
     net_shutdown_all();
     pcomm_dht_request_stop();

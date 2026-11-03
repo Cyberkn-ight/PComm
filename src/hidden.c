@@ -9,12 +9,16 @@
 #include "dht.h"
 #include "circuit.h"
 #include "receive.h"
+#include "ratchet.h"
 #include "mailbox_limits.h"
 #include "lifecycle.h"
+#include "descriptor.h"
+#include "directory.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,8 +93,11 @@ typedef struct {
     pthread_t workers[4];
     unsigned worker_count;
     atomic_int stopping;
-    size_t users; /* guarded by g_hidden_mu */
+    size_t users;
 } hidden_state_t;
+
+static int rdv_try_send(hidden_state_t *st, const char *to_user_id,
+                        const uint8_t *sealed, size_t sealed_len);
 
 static hidden_state_t *g_hidden = NULL;
 static pthread_mutex_t g_hidden_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -193,7 +200,6 @@ static void rdv_wait_remove(hidden_state_t *st, rdv_wait_t *w) {
     }
     pthread_mutex_unlock(&st->rdv_mu);
 }
-
 
 static pcomm_circuit_t *rdv_find_session(hidden_state_t *st, const char *peer_id) {
     time_t now = time(NULL);
@@ -356,7 +362,6 @@ static int pick_random_relay(pcomm_db_t *db, const char *ex1, const char *ex2, c
     sqlite3_finalize(st);
     return rc;
 }
-
 
 static int list_all_relays(pcomm_db_t *db, pcomm_peer_t **out, size_t *out_len) {
     *out = NULL; *out_len = 0;
@@ -526,17 +531,7 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
     return -1;
 }
 
-static int ctrl_build_desc_get(const uint8_t infohash[20], const uint8_t dkey[32], uint8_t **out, uint32_t *out_len) {
-    uint32_t len = 1 + 20 + 32;
-    uint8_t *b = (uint8_t*)malloc(len);
-    if (!b) return -1;
-    uint32_t off = 0;
-    b[off++] = (uint8_t)PCOMM_CTRL_DESC_GET;
-    memcpy(b + off, infohash, 20); off += 20;
-    memcpy(b + off, dkey, 32); off += 32;
-    *out = b; *out_len = len;
-    return 0;
-}
+
 
 static int ctrl_build_desc_put(const uint8_t infohash[20], const uint8_t dkey[32], uint32_t expires_unix, const uint8_t *blob, uint32_t blob_len,
                               uint8_t **out, uint32_t *out_len) {
@@ -592,191 +587,156 @@ static int ctrl_build_noop(uint8_t **out, uint32_t *out_len) {
     return 0;
 }
 
-static int parse_desc_resp(const uint8_t *payload, uint32_t payload_len, uint8_t **blob_out, uint32_t *blob_len_out) {
-    *blob_out = NULL; *blob_len_out = 0;
-    if (!payload || payload_len < 1 + 1 + 4) return -1;
-    uint32_t off = 0;
-    if (payload[off++] != (uint8_t)PCOMM_CTRL_DESC_RESP) return -1;
-    uint8_t ok = payload[off++];
-    uint32_t bl = get_u32(payload + off); off += 4;
-    if (!ok || payload_len < off + bl) return -1;
-    uint8_t *b = (uint8_t*)malloc(bl);
-    if (!b) return -1;
-    memcpy(b, payload + off, bl);
-    *blob_out = b; *blob_len_out = bl;
-    return 0;
-}
 
-static int parse_descriptor_blob(const uint8_t *blob, uint32_t blob_len, pcomm_peer_t *intros, size_t intros_cap, size_t *intros_len) {
-    *intros_len = 0;
-    if (!blob || blob_len < 1 + 4 + 1) return -1;
-    uint32_t off = 0;
-    uint8_t ver = blob[off++];
-    if (ver != 1) return -1;
-    (void)get_u32(blob + off); off += 4;
-    uint8_t cnt = blob[off++];
-    if (cnt > intros_cap) cnt = (uint8_t)intros_cap;
-
-    for (uint8_t i = 0; i < cnt; i++) {
-        if (blob_len < off + 2) break;
-        uint16_t uid_len = get_u16(blob + off); off += 2;
-        if (uid_len == 0 || uid_len > 95 || blob_len < off + uid_len) break;
-        char uid[96];
-        memcpy(uid, blob + off, uid_len); uid[uid_len] = '\0';
-        off += uid_len;
-
-        if (blob_len < off + 1) break;
-        uint8_t hlen = blob[off++];
-        if (hlen == 0 || hlen > 63 || blob_len < off + hlen + 2 + 32) break;
-        char host[64];
-        memcpy(host, blob + off, hlen); host[hlen] = '\0';
-        off += hlen;
-        uint16_t port = get_u16(blob + off); off += 2;
-        uint8_t pk[32];
-        memcpy(pk, blob + off, 32); off += 32;
-
-        pcomm_peer_t *p = &intros[*intros_len];
-        memset(p, 0, sizeof(*p));
-        snprintf(p->user_id, sizeof(p->user_id), "%s", uid);
-        snprintf(p->host, sizeof(p->host), "%s", host);
-        p->port = port;
-        memcpy(p->pubkey, pk, 32);
-        (*intros_len)++;
-    }
-    return (*intros_len > 0) ? 0 : -1;
-}
-
-static int build_descriptor_blob(uint32_t epoch, const pcomm_peer_t *intros, size_t intro_count, uint8_t **out, uint32_t *out_len) {
-    if (!out || !out_len) return -1;
-    if (intro_count > 3) intro_count = 3;
-
-    uint32_t len = 1 + 4 + 1;
-    for (size_t i = 0; i < intro_count; i++) {
-        size_t uid_len = strlen(intros[i].user_id);
-        size_t host_len = strlen(intros[i].host);
-        len += 2 + (uint32_t)uid_len + 1 + (uint32_t)host_len + 2 + 32;
-    }
-
-    uint8_t *b = (uint8_t*)malloc(len);
-    if (!b) return -1;
-    uint32_t off = 0;
-    b[off++] = 1;
-    put_u32(b + off, epoch); off += 4;
-    b[off++] = (uint8_t)intro_count;
-    for (size_t i = 0; i < intro_count; i++) {
-        uint16_t uid_len = (uint16_t)strlen(intros[i].user_id);
-        uint8_t host_len = (uint8_t)strlen(intros[i].host);
-        put_u16(b + off, uid_len); off += 2;
-        memcpy(b + off, intros[i].user_id, uid_len); off += uid_len;
-        b[off++] = host_len;
-        memcpy(b + off, intros[i].host, host_len); off += host_len;
-        put_u16(b + off, intros[i].port); off += 2;
-        memcpy(b + off, intros[i].pubkey, 32); off += 32;
-    }
-    if (off != len) { free(b); return -1; }
-    *out = b; *out_len = len;
-    return 0;
-}
 
 static int fetch_descriptor(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
                             const char *target_id, uint32_t epoch, pcomm_peer_t *intros, size_t intros_cap, size_t *intros_len) {
+    if (!db || !cfg || !me || !target_id || !intros || !intros_len || !intros_cap) return -1;
     *intros_len = 0;
-    uint8_t dkey[32];
-    sha256_key("pcomm-desc-v1", target_id, epoch, dkey);
+    uint8_t owner[32], dkey[32], infohash[20];
+    char canonical[96];
+    if (pcomm_pubkey_from_user_id(target_id, owner) ||
+        pcomm_user_id_from_pubkey(owner, canonical) ||
+        pcomm_descriptor_keys(owner, epoch, dkey, infohash)) return -1;
 
-    uint8_t infohash[20];
-    pcomm_dht_infohash_desc(target_id, infohash);
-
+    pcomm_peer_t candidates[PCOMM_DESCRIPTOR_MAX_SOURCES] = {0};
+    size_t count = 0;
     char hosts[8][64]; uint16_t ports[8]; size_t hn = 0;
-    if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0 && hn > 0) {
-        for (size_t i = 0; i < hn; i++) {
-            pcomm_peer_t dest; memset(&dest, 0, sizeof(dest));
-            snprintf(dest.host, sizeof(dest.host), "%s", hosts[i]);
-            dest.port = ports[i];
-
-            uint8_t *req = NULL; uint32_t req_len = 0;
-            if (ctrl_build_desc_get(infohash, dkey, &req, &req_len) != 0) continue;
-
-            uint8_t *resp = NULL; uint32_t resp_len = 0;
-            int rc = onion_send_ctrl(db, cfg, me, &dest, req, req_len, 1, &resp, &resp_len);
-            free(req);
-            if (rc != 0 || !resp) { free(resp); continue; }
-
-            uint8_t *blob = NULL; uint32_t blob_len = 0;
-            if (parse_desc_resp(resp, resp_len, &blob, &blob_len) == 0) {
-                if (parse_descriptor_blob(blob, blob_len, intros, intros_cap, intros_len) == 0) {
-                    free(blob);
-                    free(resp);
-                    return 0;
-                }
-                free(blob);
+    if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0) {
+        for (size_t i = 0; i < hn && count < PCOMM_DESCRIPTOR_MAX_SOURCES; i++) {
+            memcpy(candidates[count].host, hosts[i], sizeof(candidates[count].host));
+            candidates[count++].port = ports[i];
+        }
+    }
+    pcomm_peer_t directories[3]; size_t directory_count = 0;
+    if (select_hsdirs(db, canonical, epoch, directories, &directory_count) == 0) {
+        for (size_t i = 0; i < directory_count && count < PCOMM_DESCRIPTOR_MAX_SOURCES; i++) {
+            size_t j;
+            for (j = 0; j < count; j++) {
+                if (candidates[j].port == directories[i].port &&
+                    strcmp(candidates[j].host, directories[i].host) == 0) break;
             }
-            free(resp);
+            if (j == count) candidates[count++] = directories[i];
         }
     }
 
-    pcomm_peer_t hs[3]; size_t hs_len = 0;
-    if (select_hsdirs(db, target_id, epoch, hs, &hs_len) != 0) return -1;
-    for (size_t i = 0; i < hs_len; i++) {
-        uint8_t *req = NULL; uint32_t req_len = 0;
-        if (ctrl_build_desc_get(infohash, dkey, &req, &req_len) != 0) continue;
-        uint8_t *resp = NULL; uint32_t resp_len = 0;
-        int rc = onion_send_ctrl(db, cfg, me, &hs[i], req, req_len, 1, &resp, &resp_len);
-        free(req);
-        if (rc != 0 || !resp) { free(resp); continue; }
-        uint8_t *blob = NULL; uint32_t blob_len = 0;
-        if (parse_desc_resp(resp, resp_len, &blob, &blob_len) == 0) {
-            if (parse_descriptor_blob(blob, blob_len, intros, intros_cap, intros_len) == 0) {
-                free(blob);
-                free(resp);
-                return 0;
-            }
-            free(blob);
-        }
-        free(resp);
+    uint32_t addresses[PCOMM_DESCRIPTOR_MAX_SOURCES]; size_t address_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct in_addr address;
+        if (inet_pton(AF_INET, candidates[i].host, &address) != 1) continue;
+        size_t j;
+        for (j = 0; j < address_count; j++) if (addresses[j] == address.s_addr) break;
+        if (j == address_count) addresses[address_count++] = address.s_addr;
     }
-    return -1;
+    if (address_count < 2) return -1;
+
+    pcomm_descriptor_quorum_t quorum = {0};
+    for (size_t i = 0; i < count && !pcomm_shutdown_requested(); i++) {
+        struct in_addr address;
+        if (inet_pton(AF_INET, candidates[i].host, &address) != 1) continue;
+        pcomm_peer_t provider;
+        if (pcomm_dht_resolve_relay(candidates[i].host, candidates[i].port, &provider) != 0) continue;
+        uint8_t nonce[32], *request = NULL, *response = NULL, *blob = NULL;
+        uint32_t request_len = 0, response_len = 0, blob_len = 0;
+        if (pcomm_random(nonce, sizeof(nonce)) ||
+            pcomm_directory_request(infohash, dkey, nonce, &request, &request_len)) continue;
+        int rc = onion_send_ctrl(db, cfg, me, &provider, request, request_len, 1, &response, &response_len);
+        free(request);
+        if (rc == 0 && response &&
+            pcomm_directory_parse_response(response, response_len, provider.pubkey, nonce, dkey, &blob, &blob_len) == 0) {
+            pcomm_descriptor_t descriptor;
+            if (pcomm_descriptor_parse(blob, blob_len, canonical, epoch, (uint32_t)time(NULL), &descriptor) == 0) {
+                (void)pcomm_descriptor_vote(&quorum, provider.host, provider.pubkey, &descriptor);
+            }
+        }
+        free(blob);
+        free(response);
+    }
+    pcomm_descriptor_t accepted;
+    time_t checked_at = time(NULL);
+    if (pcomm_shutdown_requested() || pcomm_descriptor_consensus(&quorum, &accepted) != 0 ||
+        checked_at < 0 || (uint64_t)checked_at > UINT32_MAX ||
+        accepted.expires <= (uint32_t)checked_at || (uint64_t)accepted.issued > (uint64_t)checked_at+120 ||
+        accepted.intro_count > intros_cap ||
+        pcomm_db_descriptor_trust(db, accepted.owner, accepted.epoch, accepted.issued, accepted.digest) != 0) return -1;
+    memcpy(intros, accepted.intros, accepted.intro_count*sizeof(*intros));
+    *intros_len = accepted.intro_count;
+    return 0;
+}
+
+static int descriptor_stored_at(hidden_state_t *st, const pcomm_peer_t *provider,
+                                  const uint8_t infohash[20], const uint8_t dkey[32],
+                                  const uint8_t *expected, uint32_t expected_len) {
+    uint8_t nonce[32], *request = NULL, *response = NULL, *stored = NULL;
+    uint32_t request_len = 0, response_len = 0, stored_len = 0;
+    if (hidden_stopping(st) || pcomm_random(nonce, sizeof(nonce)) ||
+        pcomm_directory_request(infohash, dkey, nonce, &request, &request_len)) return -1;
+    int rc = onion_send_ctrl(st->db, &st->cfg, &st->me, provider,
+                              request, request_len, 1, &response, &response_len);
+    free(request);
+    if (rc == 0) rc = pcomm_directory_parse_response(response, response_len, provider->pubkey,
+                                                     nonce, dkey, &stored, &stored_len);
+    if (rc == 0 && (stored_len != expected_len || CRYPTO_memcmp(stored, expected, expected_len))) rc = -1;
+    free(stored);
+    free(response);
+    return rc == 0 ? 0 : -1;
 }
 
 static int publish_descriptor(hidden_state_t *st) {
     if (hidden_stopping(st)) return -1;
-    uint32_t ep = epoch_now();
+    time_t clock = time(NULL);
+    if (clock < 0 || (uint64_t)clock > UINT32_MAX-PCOMM_DESCRIPTOR_MAX_TTL) return -1;
+    uint32_t issued = (uint32_t)clock;
+    uint32_t ep = issued/PCOMM_DESCRIPTOR_EPOCH_SECONDS;
+    uint32_t expires = issued+PCOMM_DESCRIPTOR_MAX_TTL;
     pcomm_peer_t rel[3]; size_t rel_n = 0;
-    load_onion_relays(st->db, st->me.user_id, NULL, NULL, rel, 3, &rel_n);
-    if (rel_n == 0) return -1;
+    if (load_onion_relays(st->db, st->me.user_id, NULL, NULL, rel, 3, &rel_n) != 0 || !rel_n) return -1;
 
     pthread_mutex_lock(&st->lock);
     st->intro_count = rel_n;
     for (size_t i = 0; i < rel_n; i++) st->intros[i] = rel[i];
     pthread_mutex_unlock(&st->lock);
 
-    uint8_t *blob = NULL; uint32_t blob_len = 0;
-    if (build_descriptor_blob(ep, rel, rel_n, &blob, &blob_len) != 0) return -1;
-
-    uint8_t dkey[32];
-    sha256_key("pcomm-desc-v1", st->me.user_id, ep, dkey);
-
-    uint8_t infohash[20];
-    pcomm_dht_infohash_desc(st->me.user_id, infohash);
-
-    uint32_t expires = (uint32_t)(time(NULL) + 12*3600);
-
-    uint8_t *put = NULL; uint32_t put_len = 0;
-    if (ctrl_build_desc_put(infohash, dkey, expires, blob, blob_len, &put, &put_len) != 0) {
+    uint8_t *blob = NULL, *put = NULL;
+    uint32_t blob_len = 0, put_len = 0;
+    uint8_t dkey[32], infohash[20];
+    pcomm_descriptor_t published;
+    if (pcomm_descriptor_build(&st->me, ep, issued, expires, rel, rel_n, &blob, &blob_len) ||
+        pcomm_descriptor_parse(blob, blob_len, st->me.user_id, ep, issued, &published) ||
+        pcomm_descriptor_keys(st->me.pubkey, ep, dkey, infohash) ||
+        ctrl_build_desc_put(infohash, dkey, expires, blob, blob_len, &put, &put_len)) {
         free(blob);
         return -1;
     }
-
-    
-    for (size_t i = 0; i < rel_n && !hidden_stopping(st); i++) {
-        onion_send_ctrl(st->db, &st->cfg, &st->me, &rel[i], put, put_len, 0, NULL, NULL);
+    pcomm_peer_t destinations[6]; size_t count = rel_n;
+    memcpy(destinations, rel, rel_n*sizeof(*rel));
+    pcomm_peer_t directories[3]; size_t directory_count = 0;
+    if (select_hsdirs(st->db, st->me.user_id, ep, directories, &directory_count) == 0) {
+        for (size_t i = 0; i < directory_count; i++) {
+            size_t j;
+            for (j = 0; j < count; j++) {
+                if (destinations[j].port == directories[i].port &&
+                    strcmp(destinations[j].host, directories[i].host) == 0) break;
+            }
+            if (j == count) destinations[count++] = directories[i];
+        }
     }
-
+    uint8_t submitted[6] = {0};
+    for (size_t i = 0; i < count && !hidden_stopping(st); i++) {
+        if (onion_send_ctrl(st->db, &st->cfg, &st->me, &destinations[i], put, put_len, 0, NULL, NULL) == 0) submitted[i] = 1;
+    }
+    pcomm_descriptor_quorum_t confirmations = {0};
+    for (size_t i = 0; i < count && !hidden_stopping(st); i++) {
+        if (submitted[i] && descriptor_stored_at(st, &destinations[i], infohash, dkey, blob, blob_len) == 0) {
+            (void)pcomm_descriptor_vote(&confirmations, destinations[i].host, destinations[i].pubkey, &published);
+        }
+    }
+    pcomm_descriptor_t confirmed;
+    int replicated = pcomm_descriptor_consensus(&confirmations, &confirmed) == 0;
     free(put);
     free(blob);
-    return 0;
+    return replicated ? 0 : -1;
 }
-
 
 static int ensure_intro_circuits(hidden_state_t *st) {
     if (!st || hidden_stopping(st)) return -1;
@@ -867,7 +827,6 @@ static int handle_introduce2(hidden_state_t *st, const uint8_t *body, uint16_t b
     return result;
 }
 
-
 static int parse_mb_resp_items(hidden_state_t *st, const uint8_t *payload, uint32_t payload_len) {
     if (!payload || payload_len < 1 + 2) return -1;
     uint32_t off = 0;
@@ -905,6 +864,62 @@ static int poll_mailbox_from_peer(hidden_state_t *st, const pcomm_peer_t *peer, 
     return 0;
 }
 
+static void poll_local_mailbox(hidden_state_t *st, const uint8_t mkey[32]) {
+    uint8_t *body = NULL; uint32_t body_len = 0;
+    if (hidden_stopping(st) || pcomm_db_mailbox_get_and_delete(st->db, mkey, (int64_t)time(NULL), &body, &body_len)) return;
+    uint8_t *response = malloc((size_t)body_len+1);
+    if (response) {
+        response[0] = PCOMM_CTRL_MB_RESP;
+        memcpy(response+1, body, body_len);
+        (void)parse_mb_resp_items(st, response, body_len+1);
+        free(response);
+    }
+    free(body);
+}
+
+static void poll_unique_mailbox(hidden_state_t *st, const pcomm_peer_t *peer,
+                                  pcomm_peer_t seen[17], size_t *seen_count,
+                                  const uint8_t infohash[20], const uint8_t current[32], const uint8_t previous[32]) {
+    if (hidden_stopping(st) || *seen_count >= 17 || !strcmp(peer->user_id, st->me.user_id)) return;
+    for (size_t i = 0; i < *seen_count; i++) {
+        if (seen[i].port == peer->port && !strcmp(seen[i].host, peer->host)) return;
+    }
+    seen[(*seen_count)++] = *peer;
+    (void)poll_mailbox_from_peer(st, peer, infohash, current);
+    (void)poll_mailbox_from_peer(st, peer, infohash, previous);
+}
+
+static void flush_ratchet_outbox(pcomm_db_t *db, const pcomm_config_t *cfg,
+                                  const pcomm_identity_t *me,
+                                  hidden_state_t *hidden, unsigned limit) {
+    for (unsigned i = 0; i < limit && !pcomm_shutdown_requested() &&
+         (!hidden || !hidden_stopping(hidden)); i++) {
+        pcomm_ratchet_outgoing_t outgoing = {0};
+        int next = pcomm_ratchet_outbox_next(db, (int64_t)time(NULL), &outgoing);
+        if (next <= 0) break;
+        int rc = hidden ? rdv_try_send(hidden, outgoing.peer,
+                                       outgoing.sealed, outgoing.sealed_len) : -1;
+        if (rc != 0 && !pcomm_shutdown_requested() &&
+            (!hidden || !hidden_stopping(hidden))) {
+            rc = pcomm_hidden_mailbox_send(db, cfg, me, outgoing.peer,
+                                           outgoing.sealed, outgoing.sealed_len);
+        }
+        (void)pcomm_ratchet_outbox_sent(db, outgoing.id, rc == 0);
+        pcomm_ratchet_outgoing_free(&outgoing);
+    }
+}
+
+static void flush_after_send(pcomm_db_t *db, const pcomm_config_t *cfg,
+                              const pcomm_identity_t *me) {
+    hidden_state_t *hidden = hidden_acquire();
+    if (hidden && hidden->db != db) {
+        hidden_release(hidden);
+        hidden = NULL;
+    }
+    flush_ratchet_outbox(db, cfg, me, hidden, 1);
+    hidden_release(hidden);
+}
+
 static void *sync_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
 
@@ -914,25 +929,30 @@ static void *sync_thread(void *arg) {
         sha256_key("pcomm-mb-v1", st->me.user_id, ep, mkey_now);
         uint8_t mkey_prev[32];
         sha256_key("pcomm-mb-v1", st->me.user_id, ep ? (ep-1) : ep, mkey_prev);
+        poll_local_mailbox(st, mkey_now);
+        poll_local_mailbox(st, mkey_prev);
+        flush_ratchet_outbox(st->db, &st->cfg, &st->me, st, 8);
+        if (hidden_stopping(st)) break;
 
         uint8_t infohash[20];
         pcomm_dht_infohash_mb(st->me.user_id, infohash);
+        pcomm_peer_t seen[17]; size_t seen_count = 0;
+        for (unsigned previous = 0; previous < 2; previous++) {
+            pcomm_peer_t hs[3]; size_t hs_len = 0;
+            uint32_t directory_epoch = previous && ep ? ep-1 : ep;
+            if (select_hsdirs(st->db, st->me.user_id, directory_epoch, hs, &hs_len) == 0) {
+                for (size_t i = 0; i < hs_len; i++) {
+                    poll_unique_mailbox(st, &hs[i], seen, &seen_count, infohash, mkey_now, mkey_prev);
+                }
+            }
+        }
         char hosts[8][64]; uint16_t ports[8]; size_t hn = 0;
         if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0 && hn > 0) {
             for (size_t i = 0; i < hn && !hidden_stopping(st); i++) {
                 pcomm_peer_t p; memset(&p, 0, sizeof(p));
                 snprintf(p.host, sizeof(p.host), "%s", hosts[i]);
                 p.port = ports[i];
-                poll_mailbox_from_peer(st, &p, infohash, mkey_now);
-                poll_mailbox_from_peer(st, &p, infohash, mkey_prev);
-            }
-        } else {
-            pcomm_peer_t hs[3]; size_t hs_len = 0;
-            if (select_hsdirs(st->db, st->me.user_id, ep, hs, &hs_len) == 0) {
-                for (size_t i = 0; i < hs_len && !hidden_stopping(st); i++) {
-                    poll_mailbox_from_peer(st, &hs[i], infohash, mkey_now);
-                    poll_mailbox_from_peer(st, &hs[i], infohash, mkey_prev);
-                }
+                poll_unique_mailbox(st, &p, seen, &seen_count, infohash, mkey_now, mkey_prev);
             }
         }
 
@@ -941,9 +961,10 @@ static void *sync_thread(void *arg) {
         for (size_t i = 0; i < intro_n; i++) intros[i] = st->intros[i];
         pthread_mutex_unlock(&st->lock);
         for (size_t i = 0; i < intro_n && !hidden_stopping(st); i++) {
-            poll_mailbox_from_peer(st, &intros[i], infohash, mkey_now);
-            poll_mailbox_from_peer(st, &intros[i], infohash, mkey_prev);
+            poll_unique_mailbox(st, &intros[i], seen, &seen_count, infohash, mkey_now, mkey_prev);
         }
+
+        flush_ratchet_outbox(st->db, &st->cfg, &st->me, st, 8);
 
         {
         uint8_t r2[2] = {0};
@@ -960,9 +981,15 @@ static void *sync_thread(void *arg) {
 static void *publish_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
     while (!hidden_stopping(st)) {
-        publish_descriptor(st);
+        int published = publish_descriptor(st);
         ensure_intro_circuits(st);
-        if (hidden_wait(st, 10 * 60 * 1000) != 0) break;
+        uint32_t delay = published == 0 ? 10u*60u*1000u : 5000u;
+        time_t clock = time(NULL);
+        if (clock >= 0) {
+            uint32_t until_epoch = (PCOMM_DESCRIPTOR_EPOCH_SECONDS-(uint32_t)((uint64_t)clock%PCOMM_DESCRIPTOR_EPOCH_SECONDS))*1000u;
+            if (delay > until_epoch) delay = until_epoch;
+        }
+        if (hidden_wait(st, delay) != 0) break;
     }
     return NULL;
 }
@@ -1004,8 +1031,6 @@ static void *cover_thread(void *arg) {
     }
     return NULL;
 }
-
-
 
 static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
                                  uint8_t relay_cmd, uint16_t stream_id,
@@ -1081,7 +1106,7 @@ int pcomm_hidden_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pc
     void *(*workers[4])(void *) = {publish_thread, sync_thread, cover_thread, session_gc_thread};
     for (unsigned i = 0; i < 4; i++) {
         if (pthread_create(&st->workers[i], NULL, workers[i], st) != 0) {
-            /* Startup is aborting: interrupt already-started network work too. */
+
             pcomm_shutdown_request();
             net_shutdown_all();
             pcomm_circuits_request_stop();
@@ -1128,7 +1153,6 @@ void pcomm_hidden_stop(void) {
     while (st->users) pthread_cond_wait(&g_hidden_cv, &g_hidden_mu);
     pthread_mutex_unlock(&g_hidden_mu);
 
-    /* A closed/replaced circuit can still be unwinding its last callback. */
     pcomm_circuits_detach_events(st);
     for (size_t i = 0; i < 3; i++) pcomm_circuit_close(st->intro_circs[i].circ);
     rdv_sess_t *session = st->sessions;
@@ -1172,22 +1196,19 @@ int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const p
             pcomm_peer_t dest; memset(&dest, 0, sizeof(dest));
             snprintf(dest.host, sizeof(dest.host), "%s", hosts[i]);
             dest.port = ports[i];
-            onion_send_ctrl(db, cfg, me, &dest, put, put_len, 0, NULL, NULL);
-            ok = 0;
+            if (onion_send_ctrl(db, cfg, me, &dest, put, put_len, 0, NULL, NULL) == 0) ok = 0;
         }
     }
 
     if (intro_n > 0) {
-        onion_send_ctrl(db, cfg, me, &intros[0], put, put_len, 0, NULL, NULL);
-        ok = 0;
+        if (onion_send_ctrl(db, cfg, me, &intros[0], put, put_len, 0, NULL, NULL) == 0) ok = 0;
     }
 
     if (ok != 0) {
         pcomm_peer_t hs[3]; size_t hs_n = 0;
         if (select_hsdirs(db, recipient_id, ep, hs, &hs_n) == 0) {
             for (size_t i = 0; i < hs_n && i < 2; i++) {
-                onion_send_ctrl(db, cfg, me, &hs[i], put, put_len, 0, NULL, NULL);
-                ok = 0;
+                if (onion_send_ctrl(db, cfg, me, &hs[i], put, put_len, 0, NULL, NULL) == 0) ok = 0;
             }
         }
     }
@@ -1195,7 +1216,6 @@ int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const p
     free(put);
     return ok;
 }
-
 
 static int rdv_send_over_session(hidden_state_t *st, pcomm_circuit_t *circ, const uint8_t *sealed, size_t sealed_len) {
     if (!st || !circ || !sealed || sealed_len == 0 || hidden_stopping(st)) return -1;
@@ -1305,7 +1325,7 @@ static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, cons
     rdv_mark_established(st, cookie);
 
     pcomm_circuit_t *session = rdv_find_session(st, service_id);
-    if (!session) return -1; /* The session list still owns rp_c. */
+    if (!session) return -1;
     int rc = rdv_send_over_session(st, session, sealed, sealed_len);
     pcomm_circuit_release(session);
     return rc;
@@ -1327,7 +1347,9 @@ int pcomm_hidden_send_direct_text(pcomm_db_t *db, const pcomm_config_t *cfg, con
     if (!db || !cfg || !me || !to_user_id || !text || pcomm_shutdown_requested()) return -1;
 
     uint8_t recip_pub[32];
-    if (pcomm_pubkey_from_user_id(to_user_id, recip_pub) != 0) {
+    char canonical[96];
+    if (pcomm_pubkey_from_user_id(to_user_id, recip_pub) != 0 ||
+        pcomm_user_id_from_pubkey(recip_pub, canonical) != 0) {
         fprintf(stderr, "Bad recipient id\n");
         return -1;
     }
@@ -1337,28 +1359,11 @@ int pcomm_hidden_send_direct_text(pcomm_db_t *db, const pcomm_config_t *cfg, con
     uint8_t *plain = NULL; size_t plain_len = 0;
     if (pcomm_msg_pack_direct_text(ts, me->user_id, text, &plain, &plain_len) != 0) return -1;
 
-    uint8_t *sealed = NULL; size_t sealed_len = 0;
-    if (pcomm_seal_for_recipient(recip_pub, plain, plain_len, &sealed, &sealed_len) != 0) {
-        free(plain);
-        return -1;
-    }
+    int rc = pcomm_ratchet_send(db, me, canonical, "", plain, plain_len);
+    OPENSSL_cleanse(plain, plain_len);
     free(plain);
-
-    int send_rc = -1;
-    hidden_state_t *hidden = hidden_acquire();
-    if (hidden) send_rc = rdv_try_send(hidden, to_user_id, sealed, sealed_len);
-    hidden_release(hidden);
-    if (send_rc != 0) {
-        send_rc = pcomm_hidden_mailbox_send(db, cfg, me, to_user_id, sealed, sealed_len);
-    }
-
-    int64_t conv_id = pcomm_db_get_or_create_direct_conv(db, to_user_id);
-    if (conv_id >= 0) {
-        pcomm_db_insert_message(db, conv_id, 1, to_user_id, me->user_id, text, sealed, sealed_len, (int64_t)ts);
-    }
-
-    free(sealed);
-    return send_rc;
+    if (rc == 0) flush_after_send(db, cfg, me);
+    return rc;
 }
 
 int pcomm_hidden_send_group_invite(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
@@ -1367,22 +1372,14 @@ int pcomm_hidden_send_group_invite(pcomm_db_t *db, const pcomm_config_t *cfg, co
                                   char **members, int member_count) {
     if (!db || !cfg || !me || !member_id || !group_uuid || pcomm_shutdown_requested()) return -1;
 
-    uint8_t recip_pub[32];
-    if (pcomm_pubkey_from_user_id(member_id, recip_pub) != 0) return -1;
-
     uint32_t ts = (uint32_t)time(NULL);
     uint8_t *plain = NULL; size_t plain_len = 0;
     if (pcomm_msg_pack_group_invite(ts, me->user_id, group_uuid, title, members, member_count, &plain, &plain_len) != 0) return -1;
 
-    uint8_t *sealed = NULL; size_t sealed_len = 0;
-    if (pcomm_seal_for_recipient(recip_pub, plain, plain_len, &sealed, &sealed_len) != 0) {
-        free(plain);
-        return -1;
-    }
+    int rc = pcomm_ratchet_send(db, me, member_id, group_uuid, plain, plain_len);
+    OPENSSL_cleanse(plain, plain_len);
     free(plain);
-
-    int rc = pcomm_hidden_mailbox_send(db, cfg, me, member_id, sealed, sealed_len);
-    free(sealed);
+    if (rc == 0) flush_after_send(db, cfg, me);
     return rc;
 }
 
@@ -1391,21 +1388,13 @@ int pcomm_hidden_send_group_text(pcomm_db_t *db, const pcomm_config_t *cfg, cons
                                 const char *group_uuid, const char *text) {
     if (!db || !cfg || !me || !member_id || !group_uuid || !text || pcomm_shutdown_requested()) return -1;
 
-    uint8_t recip_pub[32];
-    if (pcomm_pubkey_from_user_id(member_id, recip_pub) != 0) return -1;
-
     uint32_t ts = (uint32_t)time(NULL);
     uint8_t *plain = NULL; size_t plain_len = 0;
     if (pcomm_msg_pack_group_text(ts, me->user_id, group_uuid, text, &plain, &plain_len) != 0) return -1;
 
-    uint8_t *sealed = NULL; size_t sealed_len = 0;
-    if (pcomm_seal_for_recipient(recip_pub, plain, plain_len, &sealed, &sealed_len) != 0) {
-        free(plain);
-        return -1;
-    }
+    int rc = pcomm_ratchet_send(db, me, member_id, group_uuid, plain, plain_len);
+    OPENSSL_cleanse(plain, plain_len);
     free(plain);
-
-    int rc = pcomm_hidden_mailbox_send(db, cfg, me, member_id, sealed, sealed_len);
-    free(sealed);
+    if (rc == 0) flush_after_send(db, cfg, me);
     return rc;
 }

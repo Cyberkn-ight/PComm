@@ -15,9 +15,6 @@ int pcomm_shutdown_requested(void) {
 #ifdef _WIN32
 #include <windows.h>
 
-/* Native winpthreads exposes condattr_setclock but rejects CLOCK_MONOTONIC.
- * Windows condition variables provide relative waits without wall-clock jumps.
- */
 static SRWLOCK g_stop_mutex = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_stop_condition = CONDITION_VARIABLE_INIT;
 
