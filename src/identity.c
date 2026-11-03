@@ -54,9 +54,10 @@ int pcomm_user_id_from_pubkey(const uint8_t pubkey[32], char out[96]) {
 
     char b32[128];
     int b32len = base32_encode_no_pad(payload, sizeof(payload), b32, sizeof(b32));
-    if (b32len < 0) return -1;
+    if (b32len < 0 || b32len > 88) return -1;
 
-    snprintf(out, 96, "pcomm1_%s", b32);
+    memcpy(out, "pcomm1_", 7);
+    memcpy(out + 7, b32, (size_t)b32len + 1);
     return 0;
 }
 

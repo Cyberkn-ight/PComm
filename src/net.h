@@ -13,4 +13,9 @@ int net_sendall(int fd, const void *buf, size_t len);
 int net_recvall(int fd, void *buf, size_t len);
 bool net_addr_is_private(const void *addr, int family);
 
+void net_shutdown(int fd);
+void net_shutdown_all(void);
+void net_close(int fd);
+size_t net_tracked_socket_count(void);
+
 #endif

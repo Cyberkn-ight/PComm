@@ -1,7 +1,11 @@
 #include "msg.h"
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 static void put_u16(uint8_t *p, uint16_t v) { uint16_t n = htons(v); memcpy(p,&n,2); }
 static void put_u32(uint8_t *p, uint32_t v) { uint32_t n = htonl(v); memcpy(p,&n,4); }
@@ -211,8 +215,8 @@ int pcomm_msg_unpack_any(const uint8_t *buf, size_t len,
 
         uint16_t mcount = get_u16(buf + off); off += 2;
         if (members_out_malloc && member_count_out) {
-            char **arr = (char**)calloc((size_t)mcount, sizeof(char*));
-            if (!arr) return -1;
+            char **arr = mcount ? (char**)calloc((size_t)mcount, sizeof(char*)) : NULL;
+            if (mcount && !arr) return -1;
             for (uint16_t i = 0; i < mcount; i++) {
                 if (len < off + 2) { pcomm_msg_free_members(arr, i); return -1; }
                 uint16_t ml = get_u16(buf + off); off += 2;

@@ -8,10 +8,17 @@
 #include "msg.h"
 #include "dht.h"
 #include "circuit.h"
+#include "receive.h"
+#include "ratchet.h"
+#include "mailbox_limits.h"
+#include "lifecycle.h"
+#include "descriptor.h"
+#include "directory.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +26,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <stdatomic.h>
 
 static void put_u16(uint8_t *p, uint16_t v){ uint16_t n=htons(v); memcpy(p,&n,2); }
 static void put_u32(uint8_t *p, uint32_t v){ uint32_t n=htonl(v); memcpy(p,&n,4); }
@@ -81,15 +89,69 @@ typedef struct {
     rdv_sess_t *sessions;
 
     pthread_mutex_t lock;
+    pthread_cond_t wake_cv;
+    pthread_t workers[4];
+    unsigned worker_count;
+    atomic_int stopping;
+    size_t users;
 } hidden_state_t;
 
-static hidden_state_t *g_hidden = NULL;
+static int rdv_try_send(hidden_state_t *st, const char *to_user_id,
+                        const uint8_t *sealed, size_t sealed_len);
 
-static void rdv_wait_init(rdv_wait_t *w, const uint8_t cookie[20]) {
+static hidden_state_t *g_hidden = NULL;
+static pthread_mutex_t g_hidden_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_hidden_cv = PTHREAD_COND_INITIALIZER;
+
+static int hidden_stopping(hidden_state_t *st) {
+    return atomic_load(&st->stopping) || pcomm_shutdown_requested();
+}
+
+static int hidden_wait(hidden_state_t *st, uint32_t milliseconds) {
+    struct timespec deadline;
+    if (timespec_get(&deadline, TIME_UTC) != TIME_UTC) return -1;
+    deadline.tv_sec += milliseconds / 1000;
+    deadline.tv_nsec += (long)(milliseconds % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&st->lock);
+    int rc = 0;
+    while (!hidden_stopping(st) && rc == 0) {
+        rc = pthread_cond_timedwait(&st->wake_cv, &st->lock, &deadline);
+    }
+    int stopped = hidden_stopping(st);
+    pthread_mutex_unlock(&st->lock);
+    return stopped ? 1 : rc == ETIMEDOUT ? 0 : -1;
+}
+
+static hidden_state_t *hidden_acquire(void) {
+    pthread_mutex_lock(&g_hidden_mu);
+    hidden_state_t *st = g_hidden;
+    if (st && !hidden_stopping(st)) st->users++;
+    else st = NULL;
+    pthread_mutex_unlock(&g_hidden_mu);
+    return st;
+}
+
+static void hidden_release(hidden_state_t *st) {
+    if (!st) return;
+    pthread_mutex_lock(&g_hidden_mu);
+    st->users--;
+    pthread_cond_broadcast(&g_hidden_cv);
+    pthread_mutex_unlock(&g_hidden_mu);
+}
+
+static int rdv_wait_init(rdv_wait_t *w, const uint8_t cookie[20]) {
     memset(w, 0, sizeof(*w));
     memcpy(w->cookie, cookie, 20);
-    pthread_mutex_init(&w->mu, NULL);
-    pthread_cond_init(&w->cv, NULL);
+    if (pthread_mutex_init(&w->mu, NULL) != 0) return -1;
+    if (pthread_cond_init(&w->cv, NULL) != 0) {
+        pthread_mutex_destroy(&w->mu);
+        return -1;
+    }
+    return 0;
 }
 
 static void rdv_wait_destroy(rdv_wait_t *w) {
@@ -116,6 +178,13 @@ static void rdv_wait_add(hidden_state_t *st, rdv_wait_t *w) {
     pthread_mutex_lock(&st->rdv_mu);
     w->next = st->waits;
     st->waits = w;
+    if (hidden_stopping(st)) {
+        pthread_mutex_lock(&w->mu);
+        w->done = 1;
+        w->ok = 0;
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->mu);
+    }
     pthread_mutex_unlock(&st->rdv_mu);
 }
 
@@ -132,14 +201,16 @@ static void rdv_wait_remove(hidden_state_t *st, rdv_wait_t *w) {
     pthread_mutex_unlock(&st->rdv_mu);
 }
 
-
-static rdv_sess_t *rdv_find_session(hidden_state_t *st, const char *peer_id) {
+static pcomm_circuit_t *rdv_find_session(hidden_state_t *st, const char *peer_id) {
     time_t now = time(NULL);
-    rdv_sess_t *best = NULL;
+    pcomm_circuit_t *best = NULL;
     pthread_mutex_lock(&st->rdv_mu);
     for (rdv_sess_t *s = st->sessions; s; s = s->next) {
         if (peer_id && peer_id[0] && strcmp(s->peer_id, peer_id) == 0) {
-            if ((now - s->last_used) < 900) best = s;
+            if (!hidden_stopping(st) && s->established && (now - s->last_used) < 900 &&
+                s->circ && pcomm_circuit_retain(s->circ) == 0) {
+                best = s->circ;
+            }
             break;
         }
     }
@@ -147,25 +218,28 @@ static rdv_sess_t *rdv_find_session(hidden_state_t *st, const char *peer_id) {
     return best;
 }
 
-static void rdv_add_or_update_session(hidden_state_t *st, const char *peer_id, const uint8_t cookie[20], pcomm_circuit_t *circ) {
+static int rdv_add_or_update_session(hidden_state_t *st, const char *peer_id, const uint8_t cookie[20], pcomm_circuit_t *circ) {
     pthread_mutex_lock(&st->rdv_mu);
+    if (hidden_stopping(st)) {
+        pthread_mutex_unlock(&st->rdv_mu);
+        return -1;
+    }
     rdv_sess_t *s = st->sessions;
     while (s) {
         if (strcmp(s->peer_id, peer_id) == 0) {
             memcpy(s->cookie, cookie, 20);
-            if (s->circ && s->circ != circ) {
-                pcomm_circuit_close(s->circ);
-            }
+            pcomm_circuit_t *old = s->circ != circ ? s->circ : NULL;
             s->circ = circ;
             s->last_used = time(NULL);
             s->established = 0;
             pthread_mutex_unlock(&st->rdv_mu);
-            return;
+            pcomm_circuit_close(old);
+            return 0;
         }
         s = s->next;
     }
     rdv_sess_t *ns = (rdv_sess_t*)calloc(1, sizeof(rdv_sess_t));
-    if (!ns) { pthread_mutex_unlock(&st->rdv_mu); return; }
+    if (!ns) { pthread_mutex_unlock(&st->rdv_mu); return -1; }
     snprintf(ns->peer_id, sizeof(ns->peer_id), "%s", peer_id);
     memcpy(ns->cookie, cookie, 20);
     ns->circ = circ;
@@ -174,6 +248,7 @@ static void rdv_add_or_update_session(hidden_state_t *st, const char *peer_id, c
     ns->next = st->sessions;
     st->sessions = ns;
     pthread_mutex_unlock(&st->rdv_mu);
+    return 0;
 }
 
 static void rdv_mark_established(hidden_state_t *st, const uint8_t cookie[20]) {
@@ -187,67 +262,32 @@ static void rdv_mark_established(hidden_state_t *st, const uint8_t cookie[20]) {
     pthread_mutex_unlock(&st->rdv_mu);
 }
 
-static void process_sealed_message(hidden_state_t *st, const uint8_t *sealed, uint32_t sealed_len, uint32_t fallback_ts) {
-    uint8_t *plain = NULL; size_t plain_len = 0;
-    if (pcomm_open_seal(st->me.privkey, sealed, sealed_len, &plain, &plain_len) != 0) return;
-
-    pcomm_plain_kind_t kind;
-    uint32_t mts = 0;
-    char sender[96] = {0};
-    char group_uuid[64] = {0};
-    char *title = NULL;
-    char **members = NULL; int member_count = 0;
-    char *text = NULL;
-
-    if (pcomm_msg_unpack_any(plain, plain_len, &kind, &mts, sender, sizeof(sender),
-                             group_uuid, sizeof(group_uuid),
-                             &title, &members, &member_count, &text) == 0) {
-        uint32_t ts = mts ? mts : fallback_ts;
-        if (kind == PCOMM_PLAIN_DIRECT_TEXT) {
-            int64_t conv_id = pcomm_db_get_or_create_direct_conv(st->db, sender);
-            if (conv_id >= 0) {
-                pcomm_db_insert_message(st->db, conv_id, 0, sender, sender, text ? text : "", sealed, sealed_len, (int64_t)ts);
-            }
-        } else if (kind == PCOMM_PLAIN_GROUP_INVITE) {
-            int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, title ? title : "");
-            if (conv_id >= 0) {
-                for (int k = 0; k < member_count; k++) pcomm_db_add_participant(st->db, conv_id, members[k]);
-                const char *body = title ? title : "Group invite";
-                pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, body, sealed, sealed_len, (int64_t)ts);
-            }
-        } else if (kind == PCOMM_PLAIN_GROUP_TEXT) {
-            int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, NULL);
-            if (conv_id >= 0) {
-                pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, text ? text : "", sealed, sealed_len, (int64_t)ts);
-            }
-        }
-    }
-
-    free(plain);
-    free(title);
-    pcomm_msg_free_members(members, member_count);
-    free(text);
-}
-
 static void *session_gc_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
     const int ttl = 20 * 60;
-    for (;;) {
+    while (!hidden_stopping(st)) {
         time_t now = time(NULL);
+        rdv_sess_t *expired = NULL;
         pthread_mutex_lock(&st->rdv_mu);
         rdv_sess_t **pp = &st->sessions;
         while (*pp) {
             rdv_sess_t *s = *pp;
             if ((now - s->last_used) > ttl) {
                 *pp = s->next;
-                if (s->circ) pcomm_circuit_close(s->circ);
-                free(s);
+                s->next = expired;
+                expired = s;
                 continue;
             }
             pp = &(*pp)->next;
         }
         pthread_mutex_unlock(&st->rdv_mu);
-        sleep(10);
+        while (expired) {
+            rdv_sess_t *next = expired->next;
+            pcomm_circuit_close(expired->circ);
+            free(expired);
+            expired = next;
+        }
+        if (hidden_wait(st, 10000) != 0) break;
     }
     return NULL;
 }
@@ -322,7 +362,6 @@ static int pick_random_relay(pcomm_db_t *db, const char *ex1, const char *ex2, c
     sqlite3_finalize(st);
     return rc;
 }
-
 
 static int list_all_relays(pcomm_db_t *db, pcomm_peer_t **out, size_t *out_len) {
     *out = NULL; *out_len = 0;
@@ -415,12 +454,15 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
                            uint8_t **resp_payload, uint32_t *resp_len) {
     if (resp_payload) *resp_payload = NULL;
     if (resp_len) *resp_len = 0;
+    if (!db || !cfg || !me || !dest || !dest->host[0] || !dest->port ||
+        pcomm_shutdown_requested()) return -1;
     pcomm_circuit_t *c = pcomm_circuit_get();
-    if (c && dest && dest->host[0] && dest->port) {
+    if (c) {
         pcomm_msg_type_t rt = 0; uint8_t *rp = NULL; uint32_t rpl = 0;
         int rc = pcomm_circuit_rpc(c, dest->host, dest->port, PCOMM_MSG_CTRL,
                                    ctrl_payload, ctrl_len, roundtrip,
                                    &rt, &rp, &rpl);
+        pcomm_circuit_release(c);
         if (rc == 0) {
             if (roundtrip) {
                 if (rt != PCOMM_MSG_CTRL) { free(rp); return -1; }
@@ -431,6 +473,7 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
         }
         free(rp);
     }
+    if (pcomm_shutdown_requested()) return -1;
 
     pcomm_peer_t path[3];
     size_t path_len = 0;
@@ -440,20 +483,20 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
         int fd = net_connect_tcp(dest->host, dest->port);
         if (fd < 0) return -1;
         int rc = pcomm_send_packet(fd, PCOMM_MSG_CTRL, NULL, ctrl_payload, ctrl_len);
-        if (rc != 0) { close(fd); return -1; }
+        if (rc != 0) { net_close(fd); return -1; }
         if (roundtrip) {
             pcomm_msg_type_t rtype; uint8_t eph[32]; uint8_t *rp=NULL; uint32_t rpl=0;
             if (pcomm_recv_packet(fd, &rtype, eph, &rp, &rpl) == 0 && rtype == PCOMM_MSG_CTRL) {
                 if (resp_payload) *resp_payload = rp; else free(rp);
                 if (resp_len) *resp_len = rpl;
-                close(fd);
+                net_close(fd);
                 return 0;
             }
             free(rp);
-            close(fd);
+            net_close(fd);
             return -1;
         }
-        close(fd);
+        net_close(fd);
         return 0;
     }
 
@@ -469,10 +512,10 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
     if (fd < 0) { free(onion); return -1; }
     int rc = pcomm_send_packet(fd, PCOMM_MSG_ONION, eph_pub, onion, onion_len);
     free(onion);
-    if (rc != 0) { close(fd); return -1; }
+    if (rc != 0) { net_close(fd); return -1; }
 
     if (!roundtrip) {
-        close(fd);
+        net_close(fd);
         return 0;
     }
 
@@ -480,25 +523,15 @@ static int onion_send_ctrl(pcomm_db_t *db, const pcomm_config_t *cfg, const pcom
     if (pcomm_recv_packet(fd, &rtype, eph, &rp, &rpl) == 0 && rtype == PCOMM_MSG_CTRL) {
         if (resp_payload) *resp_payload = rp; else free(rp);
         if (resp_len) *resp_len = rpl;
-        close(fd);
+        net_close(fd);
         return 0;
     }
     free(rp);
-    close(fd);
+    net_close(fd);
     return -1;
 }
 
-static int ctrl_build_desc_get(const uint8_t infohash[20], const uint8_t dkey[32], uint8_t **out, uint32_t *out_len) {
-    uint32_t len = 1 + 20 + 32;
-    uint8_t *b = (uint8_t*)malloc(len);
-    if (!b) return -1;
-    uint32_t off = 0;
-    b[off++] = (uint8_t)PCOMM_CTRL_DESC_GET;
-    memcpy(b + off, infohash, 20); off += 20;
-    memcpy(b + off, dkey, 32); off += 32;
-    *out = b; *out_len = len;
-    return 0;
-}
+
 
 static int ctrl_build_desc_put(const uint8_t infohash[20], const uint8_t dkey[32], uint32_t expires_unix, const uint8_t *blob, uint32_t blob_len,
                               uint8_t **out, uint32_t *out_len) {
@@ -518,6 +551,8 @@ static int ctrl_build_desc_put(const uint8_t infohash[20], const uint8_t dkey[32
 }
 
 static int ctrl_build_mb_put(const uint8_t infohash[20], const uint8_t mkey[32], const uint8_t *blob, uint32_t blob_len, uint8_t **out, uint32_t *out_len) {
+    if (!infohash || !mkey || !blob || !out || !out_len ||
+        blob_len == 0 || blob_len > PCOMM_MAILBOX_MAX_BLOB_LEN) return -1;
     uint32_t len = 1 + 20 + 32 + 4 + blob_len;
     uint8_t *b = (uint8_t*)malloc(len);
     if (!b) return -1;
@@ -552,193 +587,159 @@ static int ctrl_build_noop(uint8_t **out, uint32_t *out_len) {
     return 0;
 }
 
-static int parse_desc_resp(const uint8_t *payload, uint32_t payload_len, uint8_t **blob_out, uint32_t *blob_len_out) {
-    *blob_out = NULL; *blob_len_out = 0;
-    if (!payload || payload_len < 1 + 1 + 4) return -1;
-    uint32_t off = 0;
-    if (payload[off++] != (uint8_t)PCOMM_CTRL_DESC_RESP) return -1;
-    uint8_t ok = payload[off++];
-    uint32_t bl = get_u32(payload + off); off += 4;
-    if (!ok || payload_len < off + bl) return -1;
-    uint8_t *b = (uint8_t*)malloc(bl);
-    if (!b) return -1;
-    memcpy(b, payload + off, bl);
-    *blob_out = b; *blob_len_out = bl;
-    return 0;
-}
 
-static int parse_descriptor_blob(const uint8_t *blob, uint32_t blob_len, pcomm_peer_t *intros, size_t intros_cap, size_t *intros_len) {
-    *intros_len = 0;
-    if (!blob || blob_len < 1 + 4 + 1) return -1;
-    uint32_t off = 0;
-    uint8_t ver = blob[off++];
-    if (ver != 1) return -1;
-    (void)get_u32(blob + off); off += 4;
-    uint8_t cnt = blob[off++];
-    if (cnt > intros_cap) cnt = (uint8_t)intros_cap;
-
-    for (uint8_t i = 0; i < cnt; i++) {
-        if (blob_len < off + 2) break;
-        uint16_t uid_len = get_u16(blob + off); off += 2;
-        if (uid_len == 0 || uid_len > 95 || blob_len < off + uid_len) break;
-        char uid[96];
-        memcpy(uid, blob + off, uid_len); uid[uid_len] = '\0';
-        off += uid_len;
-
-        if (blob_len < off + 1) break;
-        uint8_t hlen = blob[off++];
-        if (hlen == 0 || hlen > 63 || blob_len < off + hlen + 2 + 32) break;
-        char host[64];
-        memcpy(host, blob + off, hlen); host[hlen] = '\0';
-        off += hlen;
-        uint16_t port = get_u16(blob + off); off += 2;
-        uint8_t pk[32];
-        memcpy(pk, blob + off, 32); off += 32;
-
-        pcomm_peer_t *p = &intros[*intros_len];
-        memset(p, 0, sizeof(*p));
-        snprintf(p->user_id, sizeof(p->user_id), "%s", uid);
-        snprintf(p->host, sizeof(p->host), "%s", host);
-        p->port = port;
-        memcpy(p->pubkey, pk, 32);
-        (*intros_len)++;
-    }
-    return (*intros_len > 0) ? 0 : -1;
-}
-
-static int build_descriptor_blob(uint32_t epoch, const pcomm_peer_t *intros, size_t intro_count, uint8_t **out, uint32_t *out_len) {
-    if (!out || !out_len) return -1;
-    if (intro_count > 3) intro_count = 3;
-
-    uint32_t len = 1 + 4 + 1;
-    for (size_t i = 0; i < intro_count; i++) {
-        size_t uid_len = strlen(intros[i].user_id);
-        size_t host_len = strlen(intros[i].host);
-        len += 2 + (uint32_t)uid_len + 1 + (uint32_t)host_len + 2 + 32;
-    }
-
-    uint8_t *b = (uint8_t*)malloc(len);
-    if (!b) return -1;
-    uint32_t off = 0;
-    b[off++] = 1;
-    put_u32(b + off, epoch); off += 4;
-    b[off++] = (uint8_t)intro_count;
-    for (size_t i = 0; i < intro_count; i++) {
-        uint16_t uid_len = (uint16_t)strlen(intros[i].user_id);
-        uint8_t host_len = (uint8_t)strlen(intros[i].host);
-        put_u16(b + off, uid_len); off += 2;
-        memcpy(b + off, intros[i].user_id, uid_len); off += uid_len;
-        b[off++] = host_len;
-        memcpy(b + off, intros[i].host, host_len); off += host_len;
-        put_u16(b + off, intros[i].port); off += 2;
-        memcpy(b + off, intros[i].pubkey, 32); off += 32;
-    }
-    if (off != len) { free(b); return -1; }
-    *out = b; *out_len = len;
-    return 0;
-}
 
 static int fetch_descriptor(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
                             const char *target_id, uint32_t epoch, pcomm_peer_t *intros, size_t intros_cap, size_t *intros_len) {
+    if (!db || !cfg || !me || !target_id || !intros || !intros_len || !intros_cap) return -1;
     *intros_len = 0;
-    uint8_t dkey[32];
-    sha256_key("pcomm-desc-v1", target_id, epoch, dkey);
+    uint8_t owner[32], dkey[32], infohash[20];
+    char canonical[96];
+    if (pcomm_pubkey_from_user_id(target_id, owner) ||
+        pcomm_user_id_from_pubkey(owner, canonical) ||
+        pcomm_descriptor_keys(owner, epoch, dkey, infohash)) return -1;
 
-    uint8_t infohash[20];
-    pcomm_dht_infohash_desc(target_id, infohash);
-
+    pcomm_peer_t candidates[PCOMM_DESCRIPTOR_MAX_SOURCES] = {0};
+    size_t count = 0;
     char hosts[8][64]; uint16_t ports[8]; size_t hn = 0;
-    if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0 && hn > 0) {
-        for (size_t i = 0; i < hn; i++) {
-            pcomm_peer_t dest; memset(&dest, 0, sizeof(dest));
-            snprintf(dest.host, sizeof(dest.host), "%s", hosts[i]);
-            dest.port = ports[i];
-
-            uint8_t *req = NULL; uint32_t req_len = 0;
-            if (ctrl_build_desc_get(infohash, dkey, &req, &req_len) != 0) continue;
-
-            uint8_t *resp = NULL; uint32_t resp_len = 0;
-            int rc = onion_send_ctrl(db, cfg, me, &dest, req, req_len, 1, &resp, &resp_len);
-            free(req);
-            if (rc != 0 || !resp) { free(resp); continue; }
-
-            uint8_t *blob = NULL; uint32_t blob_len = 0;
-            if (parse_desc_resp(resp, resp_len, &blob, &blob_len) == 0) {
-                if (parse_descriptor_blob(blob, blob_len, intros, intros_cap, intros_len) == 0) {
-                    free(blob);
-                    free(resp);
-                    return 0;
-                }
-                free(blob);
+    if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0) {
+        for (size_t i = 0; i < hn && count < PCOMM_DESCRIPTOR_MAX_SOURCES; i++) {
+            memcpy(candidates[count].host, hosts[i], sizeof(candidates[count].host));
+            candidates[count++].port = ports[i];
+        }
+    }
+    pcomm_peer_t directories[3]; size_t directory_count = 0;
+    if (select_hsdirs(db, canonical, epoch, directories, &directory_count) == 0) {
+        for (size_t i = 0; i < directory_count && count < PCOMM_DESCRIPTOR_MAX_SOURCES; i++) {
+            size_t j;
+            for (j = 0; j < count; j++) {
+                if (candidates[j].port == directories[i].port &&
+                    strcmp(candidates[j].host, directories[i].host) == 0) break;
             }
-            free(resp);
+            if (j == count) candidates[count++] = directories[i];
         }
     }
 
-    pcomm_peer_t hs[3]; size_t hs_len = 0;
-    if (select_hsdirs(db, target_id, epoch, hs, &hs_len) != 0) return -1;
-    for (size_t i = 0; i < hs_len; i++) {
-        uint8_t *req = NULL; uint32_t req_len = 0;
-        if (ctrl_build_desc_get(infohash, dkey, &req, &req_len) != 0) continue;
-        uint8_t *resp = NULL; uint32_t resp_len = 0;
-        int rc = onion_send_ctrl(db, cfg, me, &hs[i], req, req_len, 1, &resp, &resp_len);
-        free(req);
-        if (rc != 0 || !resp) { free(resp); continue; }
-        uint8_t *blob = NULL; uint32_t blob_len = 0;
-        if (parse_desc_resp(resp, resp_len, &blob, &blob_len) == 0) {
-            if (parse_descriptor_blob(blob, blob_len, intros, intros_cap, intros_len) == 0) {
-                free(blob);
-                free(resp);
-                return 0;
-            }
-            free(blob);
-        }
-        free(resp);
+    uint32_t addresses[PCOMM_DESCRIPTOR_MAX_SOURCES]; size_t address_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct in_addr address;
+        if (inet_pton(AF_INET, candidates[i].host, &address) != 1) continue;
+        size_t j;
+        for (j = 0; j < address_count; j++) if (addresses[j] == address.s_addr) break;
+        if (j == address_count) addresses[address_count++] = address.s_addr;
     }
-    return -1;
+    if (address_count < 2) return -1;
+
+    pcomm_descriptor_quorum_t quorum = {0};
+    for (size_t i = 0; i < count && !pcomm_shutdown_requested(); i++) {
+        struct in_addr address;
+        if (inet_pton(AF_INET, candidates[i].host, &address) != 1) continue;
+        pcomm_peer_t provider;
+        if (pcomm_dht_resolve_relay(candidates[i].host, candidates[i].port, &provider) != 0) continue;
+        uint8_t nonce[32], *request = NULL, *response = NULL, *blob = NULL;
+        uint32_t request_len = 0, response_len = 0, blob_len = 0;
+        if (pcomm_random(nonce, sizeof(nonce)) ||
+            pcomm_directory_request(infohash, dkey, nonce, &request, &request_len)) continue;
+        int rc = onion_send_ctrl(db, cfg, me, &provider, request, request_len, 1, &response, &response_len);
+        free(request);
+        if (rc == 0 && response &&
+            pcomm_directory_parse_response(response, response_len, provider.pubkey, nonce, dkey, &blob, &blob_len) == 0) {
+            pcomm_descriptor_t descriptor;
+            if (pcomm_descriptor_parse(blob, blob_len, canonical, epoch, (uint32_t)time(NULL), &descriptor) == 0) {
+                (void)pcomm_descriptor_vote(&quorum, provider.host, provider.pubkey, &descriptor);
+            }
+        }
+        free(blob);
+        free(response);
+    }
+    pcomm_descriptor_t accepted;
+    time_t checked_at = time(NULL);
+    if (pcomm_shutdown_requested() || pcomm_descriptor_consensus(&quorum, &accepted) != 0 ||
+        checked_at < 0 || (uint64_t)checked_at > UINT32_MAX ||
+        accepted.expires <= (uint32_t)checked_at || (uint64_t)accepted.issued > (uint64_t)checked_at+120 ||
+        accepted.intro_count > intros_cap ||
+        pcomm_db_descriptor_trust(db, accepted.owner, accepted.epoch, accepted.issued, accepted.digest) != 0) return -1;
+    memcpy(intros, accepted.intros, accepted.intro_count*sizeof(*intros));
+    *intros_len = accepted.intro_count;
+    return 0;
+}
+
+static int descriptor_stored_at(hidden_state_t *st, const pcomm_peer_t *provider,
+                                  const uint8_t infohash[20], const uint8_t dkey[32],
+                                  const uint8_t *expected, uint32_t expected_len) {
+    uint8_t nonce[32], *request = NULL, *response = NULL, *stored = NULL;
+    uint32_t request_len = 0, response_len = 0, stored_len = 0;
+    if (hidden_stopping(st) || pcomm_random(nonce, sizeof(nonce)) ||
+        pcomm_directory_request(infohash, dkey, nonce, &request, &request_len)) return -1;
+    int rc = onion_send_ctrl(st->db, &st->cfg, &st->me, provider,
+                              request, request_len, 1, &response, &response_len);
+    free(request);
+    if (rc == 0) rc = pcomm_directory_parse_response(response, response_len, provider->pubkey,
+                                                     nonce, dkey, &stored, &stored_len);
+    if (rc == 0 && (stored_len != expected_len || CRYPTO_memcmp(stored, expected, expected_len))) rc = -1;
+    free(stored);
+    free(response);
+    return rc == 0 ? 0 : -1;
 }
 
 static int publish_descriptor(hidden_state_t *st) {
-    uint32_t ep = epoch_now();
+    if (hidden_stopping(st)) return -1;
+    time_t clock = time(NULL);
+    if (clock < 0 || (uint64_t)clock > UINT32_MAX-PCOMM_DESCRIPTOR_MAX_TTL) return -1;
+    uint32_t issued = (uint32_t)clock;
+    uint32_t ep = issued/PCOMM_DESCRIPTOR_EPOCH_SECONDS;
+    uint32_t expires = issued+PCOMM_DESCRIPTOR_MAX_TTL;
     pcomm_peer_t rel[3]; size_t rel_n = 0;
-    load_onion_relays(st->db, st->me.user_id, NULL, NULL, rel, 3, &rel_n);
-    if (rel_n == 0) return -1;
+    if (load_onion_relays(st->db, st->me.user_id, NULL, NULL, rel, 3, &rel_n) != 0 || !rel_n) return -1;
 
     pthread_mutex_lock(&st->lock);
     st->intro_count = rel_n;
     for (size_t i = 0; i < rel_n; i++) st->intros[i] = rel[i];
     pthread_mutex_unlock(&st->lock);
 
-    uint8_t *blob = NULL; uint32_t blob_len = 0;
-    if (build_descriptor_blob(ep, rel, rel_n, &blob, &blob_len) != 0) return -1;
-
-    uint8_t dkey[32];
-    sha256_key("pcomm-desc-v1", st->me.user_id, ep, dkey);
-
-    uint8_t infohash[20];
-    pcomm_dht_infohash_desc(st->me.user_id, infohash);
-
-    uint32_t expires = (uint32_t)(time(NULL) + 12*3600);
-
-    uint8_t *put = NULL; uint32_t put_len = 0;
-    if (ctrl_build_desc_put(infohash, dkey, expires, blob, blob_len, &put, &put_len) != 0) {
+    uint8_t *blob = NULL, *put = NULL;
+    uint32_t blob_len = 0, put_len = 0;
+    uint8_t dkey[32], infohash[20];
+    pcomm_descriptor_t published;
+    if (pcomm_descriptor_build(&st->me, ep, issued, expires, rel, rel_n, &blob, &blob_len) ||
+        pcomm_descriptor_parse(blob, blob_len, st->me.user_id, ep, issued, &published) ||
+        pcomm_descriptor_keys(st->me.pubkey, ep, dkey, infohash) ||
+        ctrl_build_desc_put(infohash, dkey, expires, blob, blob_len, &put, &put_len)) {
         free(blob);
         return -1;
     }
-
-    
-    for (size_t i = 0; i < rel_n; i++) {
-        onion_send_ctrl(st->db, &st->cfg, &st->me, &rel[i], put, put_len, 0, NULL, NULL);
+    pcomm_peer_t destinations[6]; size_t count = rel_n;
+    memcpy(destinations, rel, rel_n*sizeof(*rel));
+    pcomm_peer_t directories[3]; size_t directory_count = 0;
+    if (select_hsdirs(st->db, st->me.user_id, ep, directories, &directory_count) == 0) {
+        for (size_t i = 0; i < directory_count; i++) {
+            size_t j;
+            for (j = 0; j < count; j++) {
+                if (destinations[j].port == directories[i].port &&
+                    strcmp(destinations[j].host, directories[i].host) == 0) break;
+            }
+            if (j == count) destinations[count++] = directories[i];
+        }
     }
-
+    uint8_t submitted[6] = {0};
+    for (size_t i = 0; i < count && !hidden_stopping(st); i++) {
+        if (onion_send_ctrl(st->db, &st->cfg, &st->me, &destinations[i], put, put_len, 0, NULL, NULL) == 0) submitted[i] = 1;
+    }
+    pcomm_descriptor_quorum_t confirmations = {0};
+    for (size_t i = 0; i < count && !hidden_stopping(st); i++) {
+        if (submitted[i] && descriptor_stored_at(st, &destinations[i], infohash, dkey, blob, blob_len) == 0) {
+            (void)pcomm_descriptor_vote(&confirmations, destinations[i].host, destinations[i].pubkey, &published);
+        }
+    }
+    pcomm_descriptor_t confirmed;
+    int replicated = pcomm_descriptor_consensus(&confirmations, &confirmed) == 0;
     free(put);
     free(blob);
-    return 0;
+    return replicated ? 0 : -1;
 }
 
-
 static int ensure_intro_circuits(hidden_state_t *st) {
-    if (!st) return -1;
+    if (!st || hidden_stopping(st)) return -1;
 
     pthread_mutex_lock(&st->lock);
     size_t n = st->intro_count;
@@ -746,7 +747,7 @@ static int ensure_intro_circuits(hidden_state_t *st) {
     for (size_t i = 0; i < n && i < 3; i++) intros[i] = st->intros[i];
     pthread_mutex_unlock(&st->lock);
 
-    for (size_t i = 0; i < n && i < 3; i++) {
+    for (size_t i = 0; i < n && i < 3 && !hidden_stopping(st); i++) {
         intro_circ_t *ic = &st->intro_circs[i];
         int need_new = 1;
         if (ic->circ && strcmp(ic->intro.host, intros[i].host) == 0 && ic->intro.port == intros[i].port) {
@@ -763,7 +764,11 @@ static int ensure_intro_circuits(hidden_state_t *st) {
         if (need_new) {
             ic->circ = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, ic->intro.host, ic->intro.port, st->me.user_id);
             if (!ic->circ) continue;
-            pcomm_circuit_set_event_cb(ic->circ, hidden_circuit_event, st);
+            if (pcomm_circuit_set_event_cb(ic->circ, hidden_circuit_event, st) != 0) {
+                pcomm_circuit_close(ic->circ);
+                ic->circ = NULL;
+                continue;
+            }
         }
 
         uint8_t body[1 + 96];
@@ -787,7 +792,7 @@ static int ensure_intro_circuits(hidden_state_t *st) {
 }
 
 static int handle_introduce2(hidden_state_t *st, const uint8_t *body, uint16_t bl) {
-    if (!st || !body) return -1;
+    if (!st || !body || hidden_stopping(st)) return -1;
     if (bl < 1 + 20 + 1 + 2) return -1;
     size_t off = 0;
     uint8_t cl = body[off++];
@@ -807,13 +812,20 @@ static int handle_introduce2(hidden_state_t *st, const uint8_t *body, uint16_t b
     uint16_t rpport = get_u16(body + off); off += 2;
     pcomm_circuit_t *rc = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, rphost, rpport, st->me.user_id);
     if (!rc) return -1;
-    pcomm_circuit_set_event_cb(rc, hidden_circuit_event, st);
-
-    rdv_add_or_update_session(st, client_id, cookie, rc);
-    pcomm_circuit_send_relay(rc, PCOMM_RELAY_RENDEZVOUS1, 0, cookie, 20);
-    return 0;
+    if (pcomm_circuit_set_event_cb(rc, hidden_circuit_event, st) != 0 ||
+        pcomm_circuit_retain(rc) != 0) {
+        pcomm_circuit_close(rc);
+        return -1;
+    }
+    if (rdv_add_or_update_session(st, client_id, cookie, rc) != 0) {
+        pcomm_circuit_release(rc);
+        pcomm_circuit_close(rc);
+        return -1;
+    }
+    int result = pcomm_circuit_send_relay(rc, PCOMM_RELAY_RENDEZVOUS1, 0, cookie, 20);
+    pcomm_circuit_release(rc);
+    return result;
 }
-
 
 static int parse_mb_resp_items(hidden_state_t *st, const uint8_t *payload, uint32_t payload_len) {
     if (!payload || payload_len < 1 + 2) return -1;
@@ -822,61 +834,23 @@ static int parse_mb_resp_items(hidden_state_t *st, const uint8_t *payload, uint3
     if (payload_len < off + 2) return -1;
     uint16_t count = get_u16(payload + off); off += 2;
 
-    for (uint16_t i = 0; i < count; i++) {
-        if (payload_len < off + 8 + 4 + 4) break;
+    for (uint16_t i = 0; i < count && !hidden_stopping(st); i++) {
+        if (payload_len - off < 8 + 4 + 4) break;
         off += 8;
         uint32_t ts = get_u32(payload + off); off += 4;
         uint32_t bl = get_u32(payload + off); off += 4;
-        if (payload_len < off + bl) break;
+        if (bl > payload_len - off) break;
         const uint8_t *sealed = payload + off;
         off += bl;
 
-        uint8_t *plain = NULL; size_t plain_len = 0;
-        if (pcomm_open_seal(st->me.privkey, sealed, bl, &plain, &plain_len) != 0) continue;
-
-        pcomm_plain_kind_t kind;
-        uint32_t mts = 0;
-        char sender[96] = {0};
-        char group_uuid[64] = {0};
-        char *title = NULL;
-        char **members = NULL; int member_count = 0;
-        char *text = NULL;
-
-        if (pcomm_msg_unpack_any(plain, plain_len, &kind, &mts, sender, sizeof(sender),
-                                 group_uuid, sizeof(group_uuid),
-                                 &title, &members, &member_count, &text) == 0) {
-            if (kind == PCOMM_PLAIN_DIRECT_TEXT) {
-                int64_t conv_id = pcomm_db_get_or_create_direct_conv(st->db, sender);
-                if (conv_id >= 0) {
-                    pcomm_db_insert_message(st->db, conv_id, 0, sender, sender, text ? text : "", sealed, bl, (int64_t)(mts ? mts : ts));
-                }
-            } else if (kind == PCOMM_PLAIN_GROUP_INVITE) {
-                int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, title ? title : "");
-                if (conv_id >= 0) {
-                    for (int k = 0; k < member_count; k++) {
-                        pcomm_db_add_participant(st->db, conv_id, members[k]);
-                    }
-                    const char *body = title ? title : "Group invite";
-                    pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, body, sealed, bl, (int64_t)(mts ? mts : ts));
-                }
-            } else if (kind == PCOMM_PLAIN_GROUP_TEXT) {
-                int64_t conv_id = pcomm_db_get_or_create_group_conv(st->db, group_uuid, NULL);
-                if (conv_id >= 0) {
-                    pcomm_db_insert_message(st->db, conv_id, 0, group_uuid, sender, text ? text : "", sealed, bl, (int64_t)(mts ? mts : ts));
-                }
-            }
-        }
-
-        free(plain);
-        free(title);
-        pcomm_msg_free_members(members, member_count);
-        free(text);
+        (void)pcomm_receive_sealed(st->db, &st->me, sealed, bl, ts);
     }
 
     return 0;
 }
 
 static int poll_mailbox_from_peer(hidden_state_t *st, const pcomm_peer_t *peer, const uint8_t infohash[20], const uint8_t mkey[32]) {
+    if (hidden_stopping(st)) return -1;
     uint8_t *req = NULL; uint32_t req_len = 0;
     if (ctrl_build_mb_get(infohash, mkey, &req, &req_len) != 0) return -1;
 
@@ -890,34 +864,95 @@ static int poll_mailbox_from_peer(hidden_state_t *st, const pcomm_peer_t *peer, 
     return 0;
 }
 
+static void poll_local_mailbox(hidden_state_t *st, const uint8_t mkey[32]) {
+    uint8_t *body = NULL; uint32_t body_len = 0;
+    if (hidden_stopping(st) || pcomm_db_mailbox_get_and_delete(st->db, mkey, (int64_t)time(NULL), &body, &body_len)) return;
+    uint8_t *response = malloc((size_t)body_len+1);
+    if (response) {
+        response[0] = PCOMM_CTRL_MB_RESP;
+        memcpy(response+1, body, body_len);
+        (void)parse_mb_resp_items(st, response, body_len+1);
+        free(response);
+    }
+    free(body);
+}
+
+static void poll_unique_mailbox(hidden_state_t *st, const pcomm_peer_t *peer,
+                                  pcomm_peer_t seen[17], size_t *seen_count,
+                                  const uint8_t infohash[20], const uint8_t current[32], const uint8_t previous[32]) {
+    if (hidden_stopping(st) || *seen_count >= 17 || !strcmp(peer->user_id, st->me.user_id)) return;
+    for (size_t i = 0; i < *seen_count; i++) {
+        if (seen[i].port == peer->port && !strcmp(seen[i].host, peer->host)) return;
+    }
+    seen[(*seen_count)++] = *peer;
+    (void)poll_mailbox_from_peer(st, peer, infohash, current);
+    (void)poll_mailbox_from_peer(st, peer, infohash, previous);
+}
+
+static void flush_ratchet_outbox(pcomm_db_t *db, const pcomm_config_t *cfg,
+                                  const pcomm_identity_t *me,
+                                  hidden_state_t *hidden, unsigned limit) {
+    for (unsigned i = 0; i < limit && !pcomm_shutdown_requested() &&
+         (!hidden || !hidden_stopping(hidden)); i++) {
+        pcomm_ratchet_outgoing_t outgoing = {0};
+        int next = pcomm_ratchet_outbox_next(db, (int64_t)time(NULL), &outgoing);
+        if (next <= 0) break;
+        int rc = hidden ? rdv_try_send(hidden, outgoing.peer,
+                                       outgoing.sealed, outgoing.sealed_len) : -1;
+        if (rc != 0 && !pcomm_shutdown_requested() &&
+            (!hidden || !hidden_stopping(hidden))) {
+            rc = pcomm_hidden_mailbox_send(db, cfg, me, outgoing.peer,
+                                           outgoing.sealed, outgoing.sealed_len);
+        }
+        (void)pcomm_ratchet_outbox_sent(db, outgoing.id, rc == 0);
+        pcomm_ratchet_outgoing_free(&outgoing);
+    }
+}
+
+static void flush_after_send(pcomm_db_t *db, const pcomm_config_t *cfg,
+                              const pcomm_identity_t *me) {
+    hidden_state_t *hidden = hidden_acquire();
+    if (hidden && hidden->db != db) {
+        hidden_release(hidden);
+        hidden = NULL;
+    }
+    flush_ratchet_outbox(db, cfg, me, hidden, 1);
+    hidden_release(hidden);
+}
+
 static void *sync_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
 
-    for (;;) {
+    while (!hidden_stopping(st)) {
         uint32_t ep = epoch_now();
         uint8_t mkey_now[32];
         sha256_key("pcomm-mb-v1", st->me.user_id, ep, mkey_now);
         uint8_t mkey_prev[32];
         sha256_key("pcomm-mb-v1", st->me.user_id, ep ? (ep-1) : ep, mkey_prev);
+        poll_local_mailbox(st, mkey_now);
+        poll_local_mailbox(st, mkey_prev);
+        flush_ratchet_outbox(st->db, &st->cfg, &st->me, st, 8);
+        if (hidden_stopping(st)) break;
 
         uint8_t infohash[20];
         pcomm_dht_infohash_mb(st->me.user_id, infohash);
+        pcomm_peer_t seen[17]; size_t seen_count = 0;
+        for (unsigned previous = 0; previous < 2; previous++) {
+            pcomm_peer_t hs[3]; size_t hs_len = 0;
+            uint32_t directory_epoch = previous && ep ? ep-1 : ep;
+            if (select_hsdirs(st->db, st->me.user_id, directory_epoch, hs, &hs_len) == 0) {
+                for (size_t i = 0; i < hs_len; i++) {
+                    poll_unique_mailbox(st, &hs[i], seen, &seen_count, infohash, mkey_now, mkey_prev);
+                }
+            }
+        }
         char hosts[8][64]; uint16_t ports[8]; size_t hn = 0;
         if (pcomm_dht_get_peers_hosts(infohash, hosts, ports, 8, &hn) == 0 && hn > 0) {
-            for (size_t i = 0; i < hn; i++) {
+            for (size_t i = 0; i < hn && !hidden_stopping(st); i++) {
                 pcomm_peer_t p; memset(&p, 0, sizeof(p));
                 snprintf(p.host, sizeof(p.host), "%s", hosts[i]);
                 p.port = ports[i];
-                poll_mailbox_from_peer(st, &p, infohash, mkey_now);
-                poll_mailbox_from_peer(st, &p, infohash, mkey_prev);
-            }
-        } else {
-            pcomm_peer_t hs[3]; size_t hs_len = 0;
-            if (select_hsdirs(st->db, st->me.user_id, ep, hs, &hs_len) == 0) {
-                for (size_t i = 0; i < hs_len; i++) {
-                    poll_mailbox_from_peer(st, &hs[i], infohash, mkey_now);
-                    poll_mailbox_from_peer(st, &hs[i], infohash, mkey_prev);
-                }
+                poll_unique_mailbox(st, &p, seen, &seen_count, infohash, mkey_now, mkey_prev);
             }
         }
 
@@ -925,18 +960,19 @@ static void *sync_thread(void *arg) {
         pcomm_peer_t intros[3]; size_t intro_n = st->intro_count;
         for (size_t i = 0; i < intro_n; i++) intros[i] = st->intros[i];
         pthread_mutex_unlock(&st->lock);
-        for (size_t i = 0; i < intro_n; i++) {
-            poll_mailbox_from_peer(st, &intros[i], infohash, mkey_now);
-            poll_mailbox_from_peer(st, &intros[i], infohash, mkey_prev);
+        for (size_t i = 0; i < intro_n && !hidden_stopping(st); i++) {
+            poll_unique_mailbox(st, &intros[i], seen, &seen_count, infohash, mkey_now, mkey_prev);
         }
 
+        flush_ratchet_outbox(st->db, &st->cfg, &st->me, st, 8);
+
         {
-        uint8_t r2[2];
+        uint8_t r2[2] = {0};
         pcomm_random(r2, 2);
         int base = (int)st->cfg.mailbox_poll_base_ms;
         if (base < 800) base = 800;
         int jitter = ((int)r2[0] << 8 | (int)r2[1]) % base;
-        usleep((useconds_t)1000 * (useconds_t)(base/2 + jitter));
+        if (hidden_wait(st, (uint32_t)(base/2 + jitter)) != 0) break;
     }
     }
     return NULL;
@@ -944,18 +980,24 @@ static void *sync_thread(void *arg) {
 
 static void *publish_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
-    for (;;) {
-        publish_descriptor(st);
+    while (!hidden_stopping(st)) {
+        int published = publish_descriptor(st);
         ensure_intro_circuits(st);
-        sleep(10 * 60);
+        uint32_t delay = published == 0 ? 10u*60u*1000u : 5000u;
+        time_t clock = time(NULL);
+        if (clock >= 0) {
+            uint32_t until_epoch = (PCOMM_DESCRIPTOR_EPOCH_SECONDS-(uint32_t)((uint64_t)clock%PCOMM_DESCRIPTOR_EPOCH_SECONDS))*1000u;
+            if (delay > until_epoch) delay = until_epoch;
+        }
+        if (hidden_wait(st, delay) != 0) break;
     }
     return NULL;
 }
 
 static void *cover_thread(void *arg) {
     hidden_state_t *st = (hidden_state_t*)arg;
-    for (;;) {
-        uint8_t r[1];
+    while (!hidden_stopping(st)) {
+        uint8_t r[1] = {0};
         pcomm_random(r, 1);
         int delay = 2 + (r[0] % 5);
         pcomm_peer_t dest;
@@ -985,19 +1027,17 @@ static void *cover_thread(void *arg) {
         }
         sqlite3_finalize(stq);
 
-        sleep(delay);
+        if (hidden_wait(st, (uint32_t)delay * 1000) != 0) break;
     }
     return NULL;
 }
-
-
 
 static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
                                  uint8_t relay_cmd, uint16_t stream_id,
                                  const uint8_t *body, uint16_t body_len) {
     (void)c;
     hidden_state_t *st = (hidden_state_t*)arg;
-    if (!st) return;
+    if (!st || hidden_stopping(st)) return;
 
     if (relay_cmd == PCOMM_RELAY_INTRODUCE2) {
         handle_introduce2(st, body, (uint16_t)body_len);
@@ -1020,7 +1060,7 @@ static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
         uint8_t *pl = NULL; uint32_t pll = 0;
         if (pcomm_unpack_packet(body, (uint32_t)body_len, &mt, eph, &pl, &pll) == 0) {
             if (mt == PCOMM_MSG_DELIVER && pl && pll > 0) {
-                process_sealed_message(st, pl, pll, (uint32_t)time(NULL));
+                (void)pcomm_receive_sealed(st->db, &st->me, pl, pll, (uint32_t)time(NULL));
             }
             free(pl);
         }
@@ -1030,38 +1070,109 @@ static void hidden_circuit_event(void *arg, pcomm_circuit_t *c,
 }
 
 int pcomm_hidden_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db) {
-    if (!cfg || !me || !db) return -1;
+    if (!cfg || !me || !db || pcomm_shutdown_requested()) return -1;
+    pthread_mutex_lock(&g_hidden_mu);
+    int started = g_hidden != NULL;
+    pthread_mutex_unlock(&g_hidden_mu);
+    if (started) return 0;
 
     hidden_state_t *st = (hidden_state_t*)calloc(1, sizeof(hidden_state_t));
     if (!st) return -1;
     st->cfg = *cfg;
     st->me = *me;
     st->db = db;
-    pthread_mutex_init(&st->lock, NULL);
-    pthread_mutex_init(&st->rdv_mu, NULL);
+    atomic_init(&st->stopping, 0);
+    if (pthread_mutex_init(&st->lock, NULL) != 0) {
+        free(st);
+        return -1;
+    }
+    if (pthread_mutex_init(&st->rdv_mu, NULL) != 0) {
+        pthread_mutex_destroy(&st->lock);
+        free(st);
+        return -1;
+    }
+    if (pthread_cond_init(&st->wake_cv, NULL) != 0) {
+        pthread_mutex_destroy(&st->rdv_mu);
+        pthread_mutex_destroy(&st->lock);
+        free(st);
+        return -1;
+    }
     st->waits = NULL;
     st->sessions = NULL;
 
+    pthread_mutex_lock(&g_hidden_mu);
     g_hidden = st;
+    pthread_mutex_unlock(&g_hidden_mu);
+    void *(*workers[4])(void *) = {publish_thread, sync_thread, cover_thread, session_gc_thread};
+    for (unsigned i = 0; i < 4; i++) {
+        if (pthread_create(&st->workers[i], NULL, workers[i], st) != 0) {
 
-    pthread_t th1, th2, th3, th4;
-    pthread_create(&th1, NULL, publish_thread, st);
-    pthread_detach(th1);
-    pthread_create(&th2, NULL, sync_thread, st);
-    pthread_detach(th2);
-    pthread_create(&th3, NULL, cover_thread, st);
-    pthread_detach(th3);
-    pthread_create(&th4, NULL, session_gc_thread, st);
-    pthread_detach(th4);
+            pcomm_shutdown_request();
+            net_shutdown_all();
+            pcomm_circuits_request_stop();
+            pcomm_hidden_stop();
+            return -1;
+        }
+        st->worker_count++;
+    }
 
     fprintf(stderr, "Hidden-service style mailbox started (publish/sync/cover)\n");
     return 0;
 }
 
+void pcomm_hidden_request_stop(void) {
+    pthread_mutex_lock(&g_hidden_mu);
+    hidden_state_t *st = g_hidden;
+    if (st) {
+        atomic_store(&st->stopping, 1);
+        pthread_mutex_lock(&st->lock);
+        pthread_cond_broadcast(&st->wake_cv);
+        pthread_mutex_unlock(&st->lock);
+        pthread_mutex_lock(&st->rdv_mu);
+        for (rdv_wait_t *w = st->waits; w; w = w->next) {
+            pthread_mutex_lock(&w->mu);
+            w->ok = 0;
+            w->done = 1;
+            pthread_cond_broadcast(&w->cv);
+            pthread_mutex_unlock(&w->mu);
+        }
+        pthread_mutex_unlock(&st->rdv_mu);
+    }
+    pthread_mutex_unlock(&g_hidden_mu);
+}
+
+void pcomm_hidden_stop(void) {
+    pcomm_hidden_request_stop();
+    pthread_mutex_lock(&g_hidden_mu);
+    hidden_state_t *st = g_hidden;
+    g_hidden = NULL;
+    pthread_mutex_unlock(&g_hidden_mu);
+    if (!st) return;
+    for (unsigned i = 0; i < st->worker_count; i++) pthread_join(st->workers[i], NULL);
+    pthread_mutex_lock(&g_hidden_mu);
+    while (st->users) pthread_cond_wait(&g_hidden_cv, &g_hidden_mu);
+    pthread_mutex_unlock(&g_hidden_mu);
+
+    pcomm_circuits_detach_events(st);
+    for (size_t i = 0; i < 3; i++) pcomm_circuit_close(st->intro_circs[i].circ);
+    rdv_sess_t *session = st->sessions;
+    while (session) {
+        rdv_sess_t *next = session->next;
+        pcomm_circuit_close(session->circ);
+        free(session);
+        session = next;
+    }
+    pthread_cond_destroy(&st->wake_cv);
+    pthread_mutex_destroy(&st->rdv_mu);
+    pthread_mutex_destroy(&st->lock);
+    free(st);
+}
+
 int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
                              const char *recipient_id,
                              const uint8_t *sealed, size_t sealed_len) {
-    if (!db || !cfg || !me || !recipient_id || !sealed || sealed_len == 0) return -1;
+    if (!db || !cfg || !me || !recipient_id || !sealed || sealed_len == 0 ||
+        sealed_len > PCOMM_MAILBOX_MAX_BLOB_LEN || pcomm_shutdown_requested()) return -1;
 
     uint32_t ep = epoch_now();
     uint8_t mkey[32];
@@ -1085,22 +1196,19 @@ int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const p
             pcomm_peer_t dest; memset(&dest, 0, sizeof(dest));
             snprintf(dest.host, sizeof(dest.host), "%s", hosts[i]);
             dest.port = ports[i];
-            onion_send_ctrl(db, cfg, me, &dest, put, put_len, 0, NULL, NULL);
-            ok = 0;
+            if (onion_send_ctrl(db, cfg, me, &dest, put, put_len, 0, NULL, NULL) == 0) ok = 0;
         }
     }
 
     if (intro_n > 0) {
-        onion_send_ctrl(db, cfg, me, &intros[0], put, put_len, 0, NULL, NULL);
-        ok = 0;
+        if (onion_send_ctrl(db, cfg, me, &intros[0], put, put_len, 0, NULL, NULL) == 0) ok = 0;
     }
 
     if (ok != 0) {
         pcomm_peer_t hs[3]; size_t hs_n = 0;
         if (select_hsdirs(db, recipient_id, ep, hs, &hs_n) == 0) {
             for (size_t i = 0; i < hs_n && i < 2; i++) {
-                onion_send_ctrl(db, cfg, me, &hs[i], put, put_len, 0, NULL, NULL);
-                ok = 0;
+                if (onion_send_ctrl(db, cfg, me, &hs[i], put, put_len, 0, NULL, NULL) == 0) ok = 0;
             }
         }
     }
@@ -1109,28 +1217,30 @@ int pcomm_hidden_mailbox_send(pcomm_db_t *db, const pcomm_config_t *cfg, const p
     return ok;
 }
 
-
-static int rdv_send_over_session(hidden_state_t *st, rdv_sess_t *sess, const uint8_t *sealed, size_t sealed_len) {
-    if (!st || !sess || !sess->circ || !sealed || sealed_len == 0) return -1;
-    if (!sess->established) return -1;
+static int rdv_send_over_session(hidden_state_t *st, pcomm_circuit_t *circ, const uint8_t *sealed, size_t sealed_len) {
+    if (!st || !circ || !sealed || sealed_len == 0 || hidden_stopping(st)) return -1;
 
     uint8_t *pkt = NULL; uint32_t pkt_len = 0;
     if (pcomm_pack_packet(PCOMM_MSG_DELIVER, NULL, sealed, (uint32_t)sealed_len, &pkt, &pkt_len) != 0) return -1;
 
     uint16_t sid = 0;
-    pcomm_circuit_alloc_stream(sess->circ, &sid);
-    pcomm_circuit_send_relay(sess->circ, PCOMM_RELAY_DATA, sid, pkt, (uint16_t)pkt_len);
-    pcomm_circuit_send_relay(sess->circ, PCOMM_RELAY_END, sid, NULL, 0);
+    int rc = pcomm_circuit_alloc_stream(circ, &sid);
+    if (rc == 0) rc = pcomm_circuit_send_relay(circ, PCOMM_RELAY_DATA, sid, pkt, (uint16_t)pkt_len);
+    if (rc == 0) rc = pcomm_circuit_send_relay(circ, PCOMM_RELAY_END, sid, NULL, 0);
     free(pkt);
 
-    pthread_mutex_lock(&st->rdv_mu);
-    sess->last_used = time(NULL);
-    pthread_mutex_unlock(&st->rdv_mu);
-    return 0;
+    if (rc == 0) {
+        pthread_mutex_lock(&st->rdv_mu);
+        for (rdv_sess_t *session = st->sessions; session; session = session->next) {
+            if (session->circ == circ) session->last_used = time(NULL);
+        }
+        pthread_mutex_unlock(&st->rdv_mu);
+    }
+    return rc;
 }
 
 static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, const uint8_t *sealed, size_t sealed_len) {
-    if (!st || !service_id || !sealed || sealed_len == 0) return -1;
+    if (!st || !service_id || !sealed || sealed_len == 0 || hidden_stopping(st)) return -1;
 
     uint32_t ep = epoch_now();
 
@@ -1149,13 +1259,24 @@ static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, cons
 
     pcomm_circuit_t *rp_c = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, rp.host, rp.port, st->me.user_id);
     if (!rp_c) return -1;
-    pcomm_circuit_set_event_cb(rp_c, hidden_circuit_event, st);
+    if (pcomm_circuit_set_event_cb(rp_c, hidden_circuit_event, st) != 0) {
+        pcomm_circuit_close(rp_c);
+        return -1;
+    }
 
     rdv_wait_t w;
-    rdv_wait_init(&w, cookie);
+    if (rdv_wait_init(&w, cookie) != 0) {
+        pcomm_circuit_close(rp_c);
+        return -1;
+    }
     rdv_wait_add(st, &w);
 
-    pcomm_circuit_send_relay(rp_c, PCOMM_RELAY_ESTABLISH_RENDEZVOUS, 0, cookie, 20);
+    if (pcomm_circuit_send_relay(rp_c, PCOMM_RELAY_ESTABLISH_RENDEZVOUS, 0, cookie, 20) != 0) {
+        rdv_wait_remove(st, &w);
+        rdv_wait_destroy(&w);
+        pcomm_circuit_close(rp_c);
+        return -1;
+    }
 
     pcomm_circuit_t *intro_c = pcomm_circuit_create_to_exit(&st->cfg, &st->me, st->db, intros[0].host, intros[0].port, st->me.user_id);
     if (intro_c) {
@@ -1183,10 +1304,10 @@ static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, cons
     ts.tv_sec += 8;
 
     pthread_mutex_lock(&w.mu);
-    while (!w.done) {
+    while (!w.done && !hidden_stopping(st)) {
         if (pthread_cond_timedwait(&w.cv, &w.mu, &ts) == ETIMEDOUT) break;
     }
-    int ok = w.ok;
+    int ok = w.ok && !hidden_stopping(st);
     pthread_mutex_unlock(&w.mu);
 
     rdv_wait_remove(st, &w);
@@ -1197,32 +1318,38 @@ static int rdv_connect_and_send(hidden_state_t *st, const char *service_id, cons
         return -1;
     }
 
-    rdv_add_or_update_session(st, service_id, cookie, rp_c);
-    rdv_mark_established(st, cookie);
-
-    rdv_sess_t *sess = rdv_find_session(st, service_id);
-    if (!sess) {
+    if (rdv_add_or_update_session(st, service_id, cookie, rp_c) != 0) {
         pcomm_circuit_close(rp_c);
         return -1;
     }
-    return rdv_send_over_session(st, sess, sealed, sealed_len);
+    rdv_mark_established(st, cookie);
+
+    pcomm_circuit_t *session = rdv_find_session(st, service_id);
+    if (!session) return -1;
+    int rc = rdv_send_over_session(st, session, sealed, sealed_len);
+    pcomm_circuit_release(session);
+    return rc;
 }
 
 static int rdv_try_send(hidden_state_t *st, const char *to_user_id, const uint8_t *sealed, size_t sealed_len) {
-    if (!st) return -1;
-    rdv_sess_t *sess = rdv_find_session(st, to_user_id);
-    if (sess && sess->circ && sess->established) {
-        if (rdv_send_over_session(st, sess, sealed, sealed_len) == 0) return 0;
+    if (!st || hidden_stopping(st)) return -1;
+    pcomm_circuit_t *session = rdv_find_session(st, to_user_id);
+    if (session) {
+        int rc = rdv_send_over_session(st, session, sealed, sealed_len);
+        pcomm_circuit_release(session);
+        if (rc == 0) return 0;
     }
     return rdv_connect_and_send(st, to_user_id, sealed, sealed_len);
 }
 
 int pcomm_hidden_send_direct_text(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
                                  const char *to_user_id, const char *text) {
-    if (!db || !cfg || !me || !to_user_id || !text) return -1;
+    if (!db || !cfg || !me || !to_user_id || !text || pcomm_shutdown_requested()) return -1;
 
     uint8_t recip_pub[32];
-    if (pcomm_pubkey_from_user_id(to_user_id, recip_pub) != 0) {
+    char canonical[96];
+    if (pcomm_pubkey_from_user_id(to_user_id, recip_pub) != 0 ||
+        pcomm_user_id_from_pubkey(recip_pub, canonical) != 0) {
         fprintf(stderr, "Bad recipient id\n");
         return -1;
     }
@@ -1232,75 +1359,42 @@ int pcomm_hidden_send_direct_text(pcomm_db_t *db, const pcomm_config_t *cfg, con
     uint8_t *plain = NULL; size_t plain_len = 0;
     if (pcomm_msg_pack_direct_text(ts, me->user_id, text, &plain, &plain_len) != 0) return -1;
 
-    uint8_t *sealed = NULL; size_t sealed_len = 0;
-    if (pcomm_seal_for_recipient(recip_pub, plain, plain_len, &sealed, &sealed_len) != 0) {
-        free(plain);
-        return -1;
-    }
+    int rc = pcomm_ratchet_send(db, me, canonical, "", plain, plain_len);
+    OPENSSL_cleanse(plain, plain_len);
     free(plain);
-
-    int send_rc = -1;
-    if (g_hidden) {
-        send_rc = rdv_try_send(g_hidden, to_user_id, sealed, sealed_len);
-    }
-    if (send_rc != 0) {
-        send_rc = pcomm_hidden_mailbox_send(db, cfg, me, to_user_id, sealed, sealed_len);
-    }
-
-    int64_t conv_id = pcomm_db_get_or_create_direct_conv(db, to_user_id);
-    if (conv_id >= 0) {
-        pcomm_db_insert_message(db, conv_id, 1, to_user_id, me->user_id, text, sealed, sealed_len, (int64_t)ts);
-    }
-
-    free(sealed);
-    return send_rc;
+    if (rc == 0) flush_after_send(db, cfg, me);
+    return rc;
 }
 
 int pcomm_hidden_send_group_invite(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
                                   const char *member_id,
                                   const char *group_uuid, const char *title,
                                   char **members, int member_count) {
-    if (!db || !cfg || !me || !member_id || !group_uuid) return -1;
-
-    uint8_t recip_pub[32];
-    if (pcomm_pubkey_from_user_id(member_id, recip_pub) != 0) return -1;
+    if (!db || !cfg || !me || !member_id || !group_uuid || pcomm_shutdown_requested()) return -1;
 
     uint32_t ts = (uint32_t)time(NULL);
     uint8_t *plain = NULL; size_t plain_len = 0;
     if (pcomm_msg_pack_group_invite(ts, me->user_id, group_uuid, title, members, member_count, &plain, &plain_len) != 0) return -1;
 
-    uint8_t *sealed = NULL; size_t sealed_len = 0;
-    if (pcomm_seal_for_recipient(recip_pub, plain, plain_len, &sealed, &sealed_len) != 0) {
-        free(plain);
-        return -1;
-    }
+    int rc = pcomm_ratchet_send(db, me, member_id, group_uuid, plain, plain_len);
+    OPENSSL_cleanse(plain, plain_len);
     free(plain);
-
-    int rc = pcomm_hidden_mailbox_send(db, cfg, me, member_id, sealed, sealed_len);
-    free(sealed);
+    if (rc == 0) flush_after_send(db, cfg, me);
     return rc;
 }
 
 int pcomm_hidden_send_group_text(pcomm_db_t *db, const pcomm_config_t *cfg, const pcomm_identity_t *me,
                                 const char *member_id,
                                 const char *group_uuid, const char *text) {
-    if (!db || !cfg || !me || !member_id || !group_uuid || !text) return -1;
-
-    uint8_t recip_pub[32];
-    if (pcomm_pubkey_from_user_id(member_id, recip_pub) != 0) return -1;
+    if (!db || !cfg || !me || !member_id || !group_uuid || !text || pcomm_shutdown_requested()) return -1;
 
     uint32_t ts = (uint32_t)time(NULL);
     uint8_t *plain = NULL; size_t plain_len = 0;
     if (pcomm_msg_pack_group_text(ts, me->user_id, group_uuid, text, &plain, &plain_len) != 0) return -1;
 
-    uint8_t *sealed = NULL; size_t sealed_len = 0;
-    if (pcomm_seal_for_recipient(recip_pub, plain, plain_len, &sealed, &sealed_len) != 0) {
-        free(plain);
-        return -1;
-    }
+    int rc = pcomm_ratchet_send(db, me, member_id, group_uuid, plain, plain_len);
+    OPENSSL_cleanse(plain, plain_len);
     free(plain);
-
-    int rc = pcomm_hidden_mailbox_send(db, cfg, me, member_id, sealed, sealed_len);
-    free(sealed);
+    if (rc == 0) flush_after_send(db, cfg, me);
     return rc;
 }

@@ -8,6 +8,9 @@
 
 int pcomm_dht_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db);
 
+void pcomm_dht_request_stop(void);
+void pcomm_dht_stop(void);
+
 void pcomm_dht_infohash_desc(const char *user_id, uint8_t out20[20]);
 void pcomm_dht_infohash_mb(const char *user_id, uint8_t out20[20]);
 
@@ -16,5 +19,7 @@ int pcomm_dht_announce(const uint8_t infohash20[20], uint16_t port);
 int pcomm_dht_get_peers_hosts(const uint8_t infohash20[20],
                              char (*hosts)[64], uint16_t *ports,
                              size_t cap, size_t *out_len);
+
+int pcomm_dht_resolve_relay(const char *host, uint16_t port, pcomm_peer_t *out);
 
 #endif

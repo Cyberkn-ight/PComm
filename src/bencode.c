@@ -48,27 +48,32 @@ int benc_list_add(benc_t *l, benc_t *item) {
     return 0;
 }
 
-int benc_dict_set(benc_t *d, const char *key, benc_t *val) {
-    if (!d || d->t != BENC_DICT || !key || !val) return -1;
-    size_t klen = strlen(key);
+static int dict_set_bytes(benc_t *d, const uint8_t *key, size_t klen, benc_t *val) {
+    if (!d || d->t != BENC_DICT || (!key && klen) || !val) return -1;
     for (size_t i=0;i<d->dict_len;i++) {
-        if (d->dict[i].klen == klen && memcmp(d->dict[i].k, key, klen) == 0) {
+        if (d->dict[i].klen == klen && (klen == 0 || memcmp(d->dict[i].k, key, klen) == 0)) {
             benc_free(d->dict[i].v);
             d->dict[i].v = val;
             return 0;
         }
     }
-    benc_kv_t *nd = (benc_kv_t*)realloc(d->dict, (d->dict_len + 1) * sizeof(benc_kv_t));
-    if (!nd) return -1;
-    d->dict = nd;
-    char *kcopy = (char*)malloc(klen);
+    if (d->dict_len >= SIZE_MAX / sizeof(benc_kv_t)) return -1;
+    char *kcopy = (char*)malloc(klen ? klen : 1);
     if (!kcopy) return -1;
-    memcpy(kcopy, key, klen);
+    if (klen) memcpy(kcopy, key, klen);
+    benc_kv_t *nd = (benc_kv_t*)realloc(d->dict, (d->dict_len + 1) * sizeof(benc_kv_t));
+    if (!nd) { free(kcopy); return -1; }
+    d->dict = nd;
     d->dict[d->dict_len].k = kcopy;
     d->dict[d->dict_len].klen = klen;
     d->dict[d->dict_len].v = val;
     d->dict_len++;
     return 0;
+}
+
+int benc_dict_set(benc_t *d, const char *key, benc_t *val) {
+    if (!key) return -1;
+    return dict_set_bytes(d, (const uint8_t *)key, strlen(key), val);
 }
 
 void benc_free(benc_t *n) {
@@ -104,14 +109,22 @@ static int parse_int(const uint8_t *buf, size_t len, size_t *pos, benc_t **out) 
     int neg = 0;
     if (buf[*pos] == '-') { neg = 1; (*pos)++; }
     if (*pos >= len || !isdigit(buf[*pos])) return -1;
-    int64_t v = 0;
+
+    if (buf[*pos] == '0' && *pos + 1 < len && isdigit(buf[*pos + 1])) return -1;
+    uint64_t magnitude = 0;
+    uint64_t limit = (uint64_t)INT64_MAX + (uint64_t)neg;
     while (*pos < len && isdigit(buf[*pos])) {
-        v = v * 10 + (buf[*pos] - '0');
+        uint64_t digit = (uint64_t)(buf[*pos] - '0');
+        if (magnitude > (limit - digit) / 10) return -1;
+        magnitude = magnitude * 10 + digit;
         (*pos)++;
     }
     if (*pos >= len || buf[*pos] != 'e') return -1;
     (*pos)++;
-    if (neg) v = -v;
+    if (neg && magnitude == 0) return -1;
+    int64_t v;
+    if (neg && magnitude == (uint64_t)INT64_MAX + UINT64_C(1)) v = INT64_MIN;
+    else v = neg ? -(int64_t)magnitude : (int64_t)magnitude;
     *out = benc_new_int(v);
     return *out ? 0 : -1;
 }
@@ -126,7 +139,7 @@ static int parse_str(const uint8_t *buf, size_t len, size_t *pos, benc_t **out) 
     }
     if (*pos >= len || buf[*pos] != ':') return -1;
     (*pos)++;
-    if (*pos + n > len) return -1;
+    if (n > len - *pos) return -1;
     *out = benc_new_str(buf + *pos, n);
     if (!*out) return -1;
     *pos += n;
@@ -171,13 +184,9 @@ static int parse_dict(const uint8_t *buf, size_t len, size_t *pos, benc_t **out)
         if (parse_str(buf, len, pos, &k) != 0) { benc_free(d); return -1; }
         benc_t *v = NULL;
         if (parse_any(buf, len, pos, &v) != 0) { benc_free(k); benc_free(d); return -1; }
-        char *ks = (char*)malloc(k->slen + 1);
-        if (!ks) { benc_free(k); benc_free(v); benc_free(d); return -1; }
-        memcpy(ks, k->s, k->slen);
-        ks[k->slen] = '\0';
+        int rc = dict_set_bytes(d, k->s, k->slen, v);
         benc_free(k);
-        if (benc_dict_set(d, ks, v) != 0) { free(ks); benc_free(v); benc_free(d); return -1; }
-        free(ks);
+        if (rc != 0) { benc_free(v); benc_free(d); return -1; }
     }
     if (*pos >= len || buf[*pos] != 'e') { benc_free(d); return -1; }
     (*pos)++;
@@ -214,6 +223,7 @@ static int wb_grow(wbuf_t *w, size_t add) {
 }
 
 static int wb_put(wbuf_t *w, const void *p, size_t n) {
+    if (n == 0) return 0;
     if (wb_grow(w, n) != 0) return -1;
     memcpy(w->b + w->len, p, n);
     w->len += n;

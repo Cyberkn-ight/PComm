@@ -16,6 +16,7 @@ PComm is a **prototype** as of rn, an onion-relay messenger written in pure C (t
 - End-to-end keepalive using `RELAY_PING/RELAY_PONG` (plus idle timeouts for dedicated circuits)
 - Hidden-service registry caps + TTL pruning on relays (intro + rendezvous cookies)
 - Relay upstream queue cap (prevents unbounded memory growth)
+- Mailbox deposit rate limits, storage quotas, and expiry
 - Exit policy safety default: relays reject connecting to private/loopback/link-local destinations unless enabled
 - DHT node persistence + maintenance (learned nodes are stored in SQLite and periodically refreshed)
 - Jittered mesh gossip interval (reduces fingerprintable periodicity)
@@ -28,8 +29,10 @@ It is inspired from my good friend [S3](https://github.com/S3NP41-v) [Pcomm proj
 
 Requirements:
 - CMake
+- A C11 compiler and POSIX threads library
 - SQLite3 development headers
 - OpenSSL 3 (libssl/libcrypto)
+- libsodium 1.0.21 or newer
 
 ```bash
 mkdir -p build
@@ -38,6 +41,13 @@ cmake --build build -j
 ```
 
 Binary: `build/pcomm`
+
+### Tests
+
+```bash
+cmake -S . -B build-tests -DBUILD_TESTING=ON
+cmake --build build-tests --target check
+```
 
 ## Run
 
@@ -67,8 +77,8 @@ This is what other nodes will learn through mesh gossip.
 
 ## Bootstrapping the mesh
 
-PComm needs *some* initial relay peers to join the network.
-Use `--peers peers.txt` as a bootstrap list.
+Join through PComm seeds with `--bootstrap HOST:PORT[,HOST:PORT...]` (repeatable,
+IPv4/DNS), or use `--peers peers.txt`. No public seed addresses are bundled.
 
 `peers.txt` format:
 
@@ -87,7 +97,8 @@ PComm will:
 
 You can send to a user just by their ID:
 - add them to contacts (host/port optional), or just paste their ID into the send box
-- the sender encrypts E2E to the recipient public key (derived from the ID)
+- the sender establishes an authenticated ephemeral session using the recipient
+  public key (derived from the ID), then encrypts with evolving conversation keys
 - messages are delivered using a Tor-inspired approach:
   - users publish a descriptor (intro points) and mailbox location hints
   - when both are online, PComm attempts rendezvous (intro + rendezvous cookie)

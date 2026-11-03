@@ -2,18 +2,99 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
 
 static int parse_hostport(const char *s, char *host_out, size_t host_cap, uint16_t *port_out) {
-    const char *colon = strrchr(s, ':');
-    if (!colon) return -1;
-    size_t hlen = (size_t)(colon - s);
-    if (hlen == 0 || hlen >= host_cap) return -1;
-    memcpy(host_out, s, hlen);
+    if (!s || !host_out || !port_out) return -1;
+    const char *host = s, *colon;
+    int ipv6 = s[0] == '[';
+    size_t hlen;
+    if (ipv6) {
+        const char *closing = strchr(s+1, ']');
+        if (!closing || closing[1] != ':') return -1;
+        host = s+1;
+        hlen = (size_t)(closing-host);
+        colon = closing+1;
+    } else {
+        colon = strchr(s, ':');
+        if (!colon || strchr(colon+1, ':')) return -1;
+        hlen = (size_t)(colon-host);
+    }
+    if (!hlen || hlen >= host_cap || !colon[1]) return -1;
+    memcpy(host_out, host, hlen);
     host_out[hlen] = '\0';
-    int port = atoi(colon + 1);
-    if (port <= 0 || port > 65535) return -1;
+    if (ipv6) {
+        struct in6_addr address;
+        if (inet_pton(AF_INET6, host_out, &address) != 1) return -1;
+    } else {
+        int numeric = 1;
+        for (size_t i = 0; i < hlen; i++) {
+            unsigned char c = (unsigned char)host_out[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_')) return -1;
+            if (!(c >= '0' && c <= '9') && c != '.') numeric = 0;
+        }
+        if (numeric) {
+            struct in_addr address;
+            if (inet_pton(AF_INET, host_out, &address) != 1) return -1;
+        } else {
+            if (host_out[0] == '.' || strstr(host_out, "..")) return -1;
+            const char *label = host_out;
+            while (*label) {
+                const char *end = strchr(label, '.');
+                if (!end) end = label+strlen(label);
+                if (*label == '-' || end == label || end[-1] == '-') return -1;
+                if (!*end) break;
+                label = end+1;
+            }
+        }
+    }
+    unsigned port = 0;
+    for (const char *p = colon+1; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        port = port*10u+(unsigned)(*p-'0');
+        if (port > 65535) return -1;
+    }
+    if (!port) return -1;
     *port_out = (uint16_t)port;
     return 0;
+}
+
+static int add_bootstrap(pcomm_config_t *cfg, const char *value) {
+    if (!value || !*value) return -1;
+    const char *cursor = value;
+    for (;;) {
+        const char *end = strchr(cursor, ',');
+        if (!end) end = cursor+strlen(cursor);
+        while (cursor < end && isspace((unsigned char)*cursor)) cursor++;
+        while (end > cursor && isspace((unsigned char)end[-1])) end--;
+        size_t len = (size_t)(end-cursor);
+        char endpoint[80];
+        pcomm_bootstrap_t seed = {0};
+        if (!len || len >= sizeof(endpoint)) return -1;
+        memcpy(endpoint, cursor, len); endpoint[len] = '\0';
+        if (parse_hostport(endpoint, seed.host, sizeof(seed.host), &seed.port) || strchr(seed.host, ':')) return -1;
+        size_t host_len = strlen(seed.host);
+        if (host_len && seed.host[host_len-1] == '.') seed.host[--host_len] = '\0';
+        for (size_t i = 0; i < host_len; i++) seed.host[i] = (char)tolower((unsigned char)seed.host[i]);
+        size_t i;
+        for (i = 0; i < cfg->bootstrap_count; i++) {
+            if (cfg->bootstrap[i].port == seed.port && strcmp(cfg->bootstrap[i].host, seed.host) == 0) break;
+        }
+        if (i == cfg->bootstrap_count) {
+            if (i >= PCOMM_MAX_BOOTSTRAP) return -1;
+            cfg->bootstrap[cfg->bootstrap_count++] = seed;
+        }
+        const char *comma = strchr(cursor, ',');
+        if (!comma) return 0;
+        cursor = comma+1;
+    }
 }
 
 void pcomm_config_defaults(pcomm_config_t *cfg) {
@@ -63,6 +144,7 @@ static void usage(const char *argv0) {
         "  --http HOST:PORT        HTTP listen address (default 127.0.0.1:8080)\n"
         "  --advertise HOST:PORT   Public relay address advertised to the mesh (default: use --relay)\n"
         "  --peers PATH            Peers file (default ./peers.txt)\n"
+        "  --bootstrap HOST:PORT[,HOST:PORT...]  PComm seeds; repeatable, IPv4/DNS\n"
         "  --allow-private-addrs   Allow private/loopback addresses in peer discovery (dev/local testing)\n"
         "  --allow-private-exit    Allow exit connections to private/loopback destinations (unsafe)\n"
         "\nPeers file format (one per line):\n"
@@ -109,6 +191,11 @@ int pcomm_config_from_argv(pcomm_config_t *cfg, int argc, char **argv) {
             cfg->advertise_port = port;
         } else if (strcmp(a, "--peers") == 0 && i + 1 < argc) {
             snprintf(cfg->peers_path, sizeof(cfg->peers_path), "%s", argv[++i]);
+        } else if (strcmp(a, "--bootstrap") == 0 && i + 1 < argc) {
+            if (add_bootstrap(cfg, argv[++i]) != 0) {
+                fprintf(stderr, "Bad --bootstrap value (up to %u unique IPv4/DNS host:port entries)\n", PCOMM_MAX_BOOTSTRAP);
+                return -1;
+            }
         } else if (strcmp(a, "--allow-private-addrs") == 0) {
             cfg->allow_private_addrs = true;
         } else if (strcmp(a, "--allow-private-exit") == 0) {

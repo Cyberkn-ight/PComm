@@ -189,21 +189,21 @@ int pcomm_seal_for_recipient(const uint8_t recipient_pub[32],
     if (pcomm_random(nonce, sizeof(nonce)) != 0) return -1;
 
     size_t ct_cap = msg_len + 16;
-    size_t total = 32 + 12 + ct_cap;
+    size_t total = PCOMM_SEAL_EPH_PUB_LEN + 12 + ct_cap;
     uint8_t *buf = (uint8_t*)malloc(total);
     if (!buf) return -1;
 
-    memcpy(buf, eph_pub, 32);
-    memcpy(buf + 32, nonce, 12);
+    memcpy(buf, eph_pub, PCOMM_SEAL_EPH_PUB_LEN);
+    memcpy(buf + PCOMM_SEAL_EPH_PUB_LEN, nonce, 12);
 
     size_t ct_len = ct_cap;
-    if (pcomm_aead_encrypt(key, nonce, NULL, 0, msg, msg_len, buf + 32 + 12, &ct_len) != 0) {
+    if (pcomm_aead_encrypt(key, nonce, NULL, 0, msg, msg_len, buf + PCOMM_SEAL_EPH_PUB_LEN + 12, &ct_len) != 0) {
         free(buf);
         return -1;
     }
 
     *out = buf;
-    *out_len = 32 + 12 + ct_len;
+    *out_len = PCOMM_SEAL_EPH_PUB_LEN + 12 + ct_len;
     return 0;
 }
 
@@ -211,12 +211,12 @@ int pcomm_open_seal(const uint8_t recipient_priv[32],
                     const uint8_t *sealed, size_t sealed_len,
                     uint8_t **out_msg, size_t *out_msg_len) {
     if (!recipient_priv || !sealed || !out_msg || !out_msg_len) return -1;
-    if (sealed_len < 32 + 12 + 16) return -1;
+    if (sealed_len < PCOMM_SEAL_EPH_PUB_LEN + 12 + 16) return -1;
 
     const uint8_t *eph_pub = sealed;
-    const uint8_t *nonce = sealed + 32;
-    const uint8_t *ct = sealed + 32 + 12;
-    size_t ct_len = sealed_len - 32 - 12;
+    const uint8_t *nonce = sealed + PCOMM_SEAL_EPH_PUB_LEN;
+    const uint8_t *ct = sealed + PCOMM_SEAL_EPH_PUB_LEN + 12;
+    size_t ct_len = sealed_len - PCOMM_SEAL_EPH_PUB_LEN - 12;
 
     uint8_t shared[32];
     if (pcomm_x25519_derive(recipient_priv, eph_pub, shared) != 0) return -1;

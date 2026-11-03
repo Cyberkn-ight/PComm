@@ -5,6 +5,7 @@
 #include "cell.h"
 #include "crypto.h"
 #include "db.h"
+#include "lifecycle.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -15,6 +16,7 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 #define PCOMM_CIRC_ID 1
 #define PCOMM_MAX_HOPS 3
@@ -25,14 +27,14 @@ typedef struct stream_wait {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     uint8_t *buf;
-    size_t len;
+    uint32_t len;
     int done;
     int saw_end;
     int err;
 } stream_wait_t;
 
 struct pcomm_circuit {
-    int fd; // TCP connection to guard
+    atomic_int fd;
     pcomm_peer_t path[PCOMM_MAX_HOPS];
     size_t nhops;
 
@@ -41,8 +43,13 @@ struct pcomm_circuit {
 
     pthread_t rx_thread;
     pthread_t maint_thread;
+    int rx_started;
+    int maint_started;
+    atomic_int rx_done;
+    atomic_int maint_done;
 
     pthread_mutex_t mu;
+    pthread_cond_t cv;
     uint16_t next_stream;
     stream_wait_t *streams[STREAM_MAP_CAP];
 
@@ -51,24 +58,36 @@ struct pcomm_circuit {
     uint64_t bytes_sent;
     uint64_t bytes_recv;
 
-    int running;
+    atomic_int running;
 
     pcomm_relay_event_cb event_cb;
     void *event_cb_arg;
+    void *active_cb_arg;
+    unsigned active_callbacks;
 
     pcomm_config_t cfg;
 
     int is_dedicated;
+    size_t refs;
+    int owner_released;
+    struct pcomm_circuit *registry_next;
 };
 
 static pthread_t g_mgr_th;
 static pthread_mutex_t g_mgr_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_mgr_cv = PTHREAD_COND_INITIALIZER;
+static atomic_int g_mgr_stopping = 0;
+static int g_mgr_started;
+static pcomm_circuit_t *g_circuits = NULL;
 static pcomm_circuit_t *g_primary = NULL;
 static pcomm_circuit_t *g_spare = NULL;
 
 static pcomm_config_t g_cfg;
 static pcomm_identity_t g_me;
 static pcomm_db_t *g_db = NULL;
+
+static void circuit_request_stop(pcomm_circuit_t *c);
+static void circuit_reap_closed(void);
 
 static void stream_wait_free(stream_wait_t *w) {
     if (!w) return;
@@ -82,8 +101,15 @@ static stream_wait_t *stream_wait_new(uint16_t id) {
     stream_wait_t *w = (stream_wait_t*)calloc(1, sizeof(*w));
     if (!w) return NULL;
     w->id = id;
-    pthread_mutex_init(&w->mu, NULL);
-    pthread_cond_init(&w->cv, NULL);
+    if (pthread_mutex_init(&w->mu, NULL) != 0) {
+        free(w);
+        return NULL;
+    }
+    if (pthread_cond_init(&w->cv, NULL) != 0) {
+        pthread_mutex_destroy(&w->mu);
+        free(w);
+        return NULL;
+    }
     return w;
 }
 
@@ -95,17 +121,13 @@ static void stream_deliver(stream_wait_t *w, const uint8_t *data, uint16_t len, 
         return;
     }
     if (data && len) {
-        uint8_t *nb = (uint8_t*)realloc(w->buf, w->len + len);
-        if (!nb) {
+        if (pcomm_packet_append(&w->buf, &w->len, data, len) != 0) {
             w->err = 1;
             w->done = 1;
             pthread_cond_broadcast(&w->cv);
             pthread_mutex_unlock(&w->mu);
             return;
         }
-        w->buf = nb;
-        memcpy(w->buf + w->len, data, len);
-        w->len += len;
     }
     if (is_end) {
         w->saw_end = 1;
@@ -136,7 +158,7 @@ static stream_wait_t *stream_map_get(pcomm_circuit_t *c, uint16_t id) {
     for (size_t n = 0; n < STREAM_MAP_CAP; n++) {
         size_t idx = (i + n) % STREAM_MAP_CAP;
         stream_wait_t *w = c->streams[idx];
-        if (!w) return NULL;
+        if (!w) continue;
         if (w->id == id) return w;
     }
     return NULL;
@@ -147,12 +169,86 @@ static void stream_map_del(pcomm_circuit_t *c, uint16_t id) {
     for (size_t n = 0; n < STREAM_MAP_CAP; n++) {
         size_t idx = (i + n) % STREAM_MAP_CAP;
         stream_wait_t *w = c->streams[idx];
-        if (!w) return;
+        if (!w) continue;
         if (w->id == id) {
             c->streams[idx] = NULL;
             return;
         }
     }
+}
+
+static void circuit_request_stop(pcomm_circuit_t *c) {
+    atomic_store(&c->running, 0);
+    net_shutdown(atomic_load(&c->fd));
+    pthread_mutex_lock(&c->mu);
+    for (size_t i = 0; i < STREAM_MAP_CAP; i++) {
+        stream_wait_t *w = c->streams[i];
+        if (!w) continue;
+        pthread_mutex_lock(&w->mu);
+        if (!w->done) {
+            w->err = 1;
+            w->done = 1;
+        }
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->mu);
+    }
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+}
+
+static int circuit_wait(pcomm_circuit_t *c, uint32_t milliseconds) {
+    struct timespec deadline;
+    if (timespec_get(&deadline, TIME_UTC) != TIME_UTC) return -1;
+    deadline.tv_sec += milliseconds / 1000;
+    deadline.tv_nsec += (long)(milliseconds % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&c->mu);
+    int rc = 0;
+    while (atomic_load(&c->running) && !pcomm_shutdown_requested() && rc == 0) {
+        rc = pthread_cond_timedwait(&c->cv, &c->mu, &deadline);
+    }
+    int stopped = !atomic_load(&c->running) || pcomm_shutdown_requested();
+    pthread_mutex_unlock(&c->mu);
+    return stopped ? 1 : rc == ETIMEDOUT ? 0 : -1;
+}
+
+static pcomm_circuit_t *circuit_new(const pcomm_config_t *cfg, int dedicated) {
+    pcomm_circuit_t *c = (pcomm_circuit_t *)calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    if (pthread_mutex_init(&c->mu, NULL) != 0) {
+        free(c);
+        return NULL;
+    }
+    if (pthread_cond_init(&c->cv, NULL) != 0) {
+        pthread_mutex_destroy(&c->mu);
+        free(c);
+        return NULL;
+    }
+    atomic_init(&c->fd, -1);
+    atomic_init(&c->running, 1);
+    atomic_init(&c->rx_done, 1);
+    atomic_init(&c->maint_done, 1);
+    c->cfg = *cfg;
+    c->is_dedicated = dedicated;
+    c->next_stream = 1;
+    c->created_at = time(NULL);
+    c->last_io = c->created_at;
+    c->refs = 1;
+    pthread_mutex_lock(&g_mgr_mu);
+    if (atomic_load(&g_mgr_stopping) || pcomm_shutdown_requested()) {
+        pthread_mutex_unlock(&g_mgr_mu);
+        pthread_cond_destroy(&c->cv);
+        pthread_mutex_destroy(&c->mu);
+        free(c);
+        return NULL;
+    }
+    c->registry_next = g_circuits;
+    g_circuits = c;
+    pthread_mutex_unlock(&g_mgr_mu);
+    return c;
 }
 
 static void circuit_touch(pcomm_circuit_t *c) {
@@ -221,9 +317,10 @@ static int recv_cell_raw(int fd, uint8_t *cell_cmd, uint8_t **cell_payload, uint
 }
 
 static int send_relay_plain_locked(pcomm_circuit_t *c, const uint8_t *plain, uint16_t plain_len) {
+    if (!atomic_load(&c->running) || pcomm_shutdown_requested()) return -1;
     uint8_t *wrapped = NULL;
     uint16_t wrapped_len = 0;
-    if (pcomm_relay_wrap_forward(c->fwd, c->nhops, PCOMM_CIRC_ID, plain, plain_len, &wrapped, &wrapped_len) != 0) return -1;
+    if (pcomm_relay_wrap_forward((const uint8_t (*)[32])c->fwd, c->nhops, PCOMM_CIRC_ID, plain, plain_len, &wrapped, &wrapped_len) != 0) return -1;
     int rc = send_cell_raw(c->fd, PCOMM_CELL_RELAY, wrapped, wrapped_len);
     if (rc == 0) {
         c->bytes_sent += wrapped_len;
@@ -248,11 +345,10 @@ static uint16_t alloc_stream_id_locked(pcomm_circuit_t *c) {
     return sid;
 }
 
-
 static void *rx_loop(void *arg) {
     pcomm_circuit_t *c = (pcomm_circuit_t*)arg;
 
-    while (c->running) {
+    while (atomic_load(&c->running) && !pcomm_shutdown_requested()) {
         pcomm_msg_type_t t;
         uint8_t eph[32];
         uint8_t *p = NULL;
@@ -280,7 +376,7 @@ static void *rx_loop(void *arg) {
         if (cmd == PCOMM_CELL_RELAY) {
             uint8_t *plain = NULL;
             uint16_t plain_len = 0;
-            if (pcomm_relay_unwrap_backward_all(c->bwd, c->nhops, PCOMM_CIRC_ID, cpl, cpll, &plain, &plain_len) == 0) {
+            if (pcomm_relay_unwrap_backward_all((const uint8_t (*)[32])c->bwd, c->nhops, PCOMM_CIRC_ID, cpl, cpll, &plain, &plain_len) == 0) {
                 uint8_t rcmd;
                 uint16_t sid;
                 const uint8_t *body;
@@ -292,10 +388,6 @@ static void *rx_loop(void *arg) {
                     circuit_touch(c);
 
                     stream_wait_t *w = stream_map_get(c, sid);
-                    pcomm_relay_event_cb cb = c->event_cb;
-                    void *cb_arg = c->event_cb_arg;
-                    pthread_mutex_unlock(&c->mu);
-
                     int consumed = 0;
                     if (w) {
                         if (rcmd == PCOMM_RELAY_DATA) {
@@ -313,8 +405,24 @@ static void *rx_loop(void *arg) {
                         consumed = 1;
                     }
 
-                    if (!consumed && cb) {
+                    pcomm_relay_event_cb cb = NULL;
+                    void *cb_arg = NULL;
+                    if (!consumed && atomic_load(&c->running) && !pcomm_shutdown_requested()) {
+                        cb = c->event_cb;
+                        cb_arg = c->event_cb_arg;
+                        if (cb) {
+                            c->active_callbacks++;
+                            c->active_cb_arg = cb_arg;
+                        }
+                    }
+                    pthread_mutex_unlock(&c->mu);
+                    if (cb) {
                         cb(cb_arg, c, rcmd, sid, body, bl);
+                        pthread_mutex_lock(&c->mu);
+                        c->active_callbacks--;
+                        c->active_cb_arg = NULL;
+                        pthread_cond_broadcast(&c->cv);
+                        pthread_mutex_unlock(&c->mu);
                     }
                 }
                 free(plain);
@@ -324,32 +432,27 @@ static void *rx_loop(void *arg) {
         free(p);
     }
 
-    pthread_mutex_lock(&c->mu);
-    for (size_t i = 0; i < STREAM_MAP_CAP; i++) {
-        stream_wait_t *w = c->streams[i];
-        if (w) stream_deliver(w, NULL, 0, 1);
-    }
-    pthread_mutex_unlock(&c->mu);
-
-    c->running = 0;
+    circuit_request_stop(c);
+    atomic_store(&c->rx_done, 1);
     return NULL;
 }
 
 static void *maint_loop(void *arg) {
     pcomm_circuit_t *c = (pcomm_circuit_t*)arg;
 
-    uint8_t r[1];
+    uint8_t r[1] = {0};
     (void)pcomm_random(r, 1);
-    usleep((useconds_t)(1000 * (200 + (r[0] % 200))));
+    if (circuit_wait(c, 200 + (r[0] % 200)) != 0) goto done;
 
-    for (;;) {
-        if (!c->running) break;
+    while (atomic_load(&c->running) && !pcomm_shutdown_requested()) {
 
         time_t now = time(NULL);
+        pthread_mutex_lock(&c->mu);
         time_t last = c->last_io ? c->last_io : c->created_at;
 
         if (c->is_dedicated && c->cfg.dedicated_circuit_idle_sec > 0) {
             if ((uint32_t)(now - last) > c->cfg.dedicated_circuit_idle_sec) {
+                pthread_mutex_unlock(&c->mu);
                 break;
             }
         }
@@ -358,22 +461,21 @@ static void *maint_loop(void *arg) {
             if ((uint32_t)(now - last) * 1000U >= c->cfg.circuit_keepalive_idle_ms) {
                 uint8_t nonce[8];
                 (void)pcomm_random(nonce, sizeof(nonce));
-                pthread_mutex_lock(&c->mu);
                 (void)send_relay_cmd_locked(c, PCOMM_RELAY_PING, 0, nonce, (uint16_t)sizeof(nonce));
-                pthread_mutex_unlock(&c->mu);
             }
         }
+        pthread_mutex_unlock(&c->mu);
 
         (void)pcomm_random(r, 1);
         int ms = 8000 + (r[0] % 9000);
-        usleep((useconds_t)(1000 * ms));
+        if (circuit_wait(c, (uint32_t)ms) != 0) break;
     }
 
-    c->running = 0;
-    shutdown(c->fd, SHUT_RDWR);
+done:
+    circuit_request_stop(c);
+    atomic_store(&c->maint_done, 1);
     return NULL;
 }
-
 
 static int db_pick_random_relays(pcomm_db_t *db,
                                 const char *exclude1,
@@ -444,15 +546,12 @@ static int db_pick_guard(pcomm_db_t *db, pcomm_peer_t *guard_out) {
 }
 
 static int circuit_build(pcomm_circuit_t *c, const pcomm_peer_t *path, size_t path_len) {
-    memset(c, 0, sizeof(*c));
-    pthread_mutex_init(&c->mu, NULL);
-    c->fd = -1;
-    c->next_stream = 1;
-    c->created_at = time(NULL);
-    c->last_io = c->created_at;
+    if (!path || path_len == 0 || path_len > PCOMM_MAX_HOPS ||
+        !atomic_load(&c->running) || pcomm_shutdown_requested()) return -1;
 
     c->fd = net_connect_tcp(path[0].host, path[0].port);
     if (c->fd < 0) return -1;
+    if (!atomic_load(&c->running) || pcomm_shutdown_requested()) return -1;
 
     static const uint8_t basepoint[32] = {9};
 
@@ -480,6 +579,7 @@ static int circuit_build(pcomm_circuit_t *c, const pcomm_peer_t *path, size_t pa
     c->nhops = 1;
 
     for (size_t hi = 1; hi < path_len; hi++) {
+        if (!atomic_load(&c->running) || pcomm_shutdown_requested()) return -1;
         uint8_t eph_priv[32], eph_pub[32];
         if (pcomm_random(eph_priv, 32) != 0) return -1;
         if (pcomm_x25519_derive(eph_priv, basepoint, eph_pub) != 0) return -1;
@@ -525,7 +625,7 @@ static int circuit_build(pcomm_circuit_t *c, const pcomm_peer_t *path, size_t pa
 
         uint8_t *ext_plain = NULL;
         uint16_t ext_plain_len = 0;
-        if (pcomm_relay_unwrap_backward_all(c->bwd, c->nhops, PCOMM_CIRC_ID, cpl, cpll, &ext_plain, &ext_plain_len) != 0) {
+        if (pcomm_relay_unwrap_backward_all((const uint8_t (*)[32])c->bwd, c->nhops, PCOMM_CIRC_ID, cpl, cpll, &ext_plain, &ext_plain_len) != 0) {
             free(pp);
             return -1;
         }
@@ -552,36 +652,55 @@ static int circuit_build(pcomm_circuit_t *c, const pcomm_peer_t *path, size_t pa
         c->nhops++;
     }
 
-    c->running = 1;
-    if (pthread_create(&c->rx_thread, NULL, rx_loop, c) != 0) return -1;
-    if (pthread_create(&c->maint_thread, NULL, maint_loop, c) != 0) return -1;
+    if (!atomic_load(&c->running) || pcomm_shutdown_requested()) return -1;
+    atomic_store(&c->rx_done, 0);
+    if (pthread_create(&c->rx_thread, NULL, rx_loop, c) != 0) {
+        atomic_store(&c->rx_done, 1);
+        return -1;
+    }
+    c->rx_started = 1;
+    atomic_store(&c->maint_done, 0);
+    if (pthread_create(&c->maint_thread, NULL, maint_loop, c) != 0) {
+        atomic_store(&c->maint_done, 1);
+        circuit_request_stop(c);
+        pthread_join(c->rx_thread, NULL);
+        c->rx_started = 0;
+        return -1;
+    }
+    c->maint_started = 1;
 
     return 0;
 }
 
-static void circuit_close_internal(pcomm_circuit_t *c) {
-    if (!c) return;
-
-    c->running = 0;
-    if (c->fd >= 0) shutdown(c->fd, SHUT_RDWR);
-
-    if (c->rx_thread) pthread_join(c->rx_thread, NULL);
-    if (c->maint_thread) pthread_join(c->maint_thread, NULL);
-
-    if (c->fd >= 0) close(c->fd);
-
-    pthread_mutex_lock(&c->mu);
+static void circuit_destroy(pcomm_circuit_t *c) {
+    circuit_request_stop(c);
+    if (c->rx_started) pthread_join(c->rx_thread, NULL);
+    if (c->maint_started) pthread_join(c->maint_thread, NULL);
+    net_close(atomic_exchange(&c->fd, -1));
     for (size_t i = 0; i < STREAM_MAP_CAP; i++) {
         stream_wait_t *w = c->streams[i];
         c->streams[i] = NULL;
         stream_wait_free(w);
     }
-    pthread_mutex_unlock(&c->mu);
-
+    pthread_cond_destroy(&c->cv);
     pthread_mutex_destroy(&c->mu);
     free(c);
 }
 
+static void circuit_reap_closed(void) {
+    for (;;) {
+        pthread_mutex_lock(&g_mgr_mu);
+        pcomm_circuit_t **slot = &g_circuits;
+        while (*slot && !((*slot)->owner_released && (*slot)->refs == 0 &&
+                         atomic_load(&(*slot)->rx_done) &&
+                         atomic_load(&(*slot)->maint_done))) slot = &(*slot)->registry_next;
+        pcomm_circuit_t *c = *slot;
+        if (c) *slot = c->registry_next;
+        pthread_mutex_unlock(&g_mgr_mu);
+        if (!c) break;
+        circuit_destroy(c);
+    }
+}
 
 static pcomm_circuit_t *build_new_circuit(int is_dedicated,
                                          const char *exit_host,
@@ -618,91 +737,75 @@ static pcomm_circuit_t *build_new_circuit(int is_dedicated,
 
     if (!is_dedicated && n == 0) return NULL;
 
-    pcomm_circuit_t *c = (pcomm_circuit_t*)calloc(1, sizeof(*c));
+    pcomm_circuit_t *c = circuit_new(&g_cfg, is_dedicated);
     if (!c) return NULL;
-    c->cfg = g_cfg;
-    c->is_dedicated = is_dedicated;
 
     if (circuit_build(c, path, n) != 0) {
-        circuit_close_internal(c);
+        pcomm_circuit_close(c);
         return NULL;
     }
 
     return c;
 }
 
-static void mgr_swap_primary_locked(void) {
-    if (g_primary) {
-        circuit_close_internal(g_primary);
-        g_primary = NULL;
-    }
-    if (g_spare) {
-        g_primary = g_spare;
-        g_spare = NULL;
-    }
+static void mgr_install(pcomm_circuit_t *c, int spare) {
+    if (!c) return;
+    pthread_mutex_lock(&g_mgr_mu);
+    pcomm_circuit_t **slot = spare ? &g_spare : &g_primary;
+    int installed = !*slot && !atomic_load(&g_mgr_stopping) && !pcomm_shutdown_requested();
+    if (installed) *slot = c;
+    pthread_mutex_unlock(&g_mgr_mu);
+    if (!installed) pcomm_circuit_close(c);
 }
 
 static void mgr_tick(void) {
+    if (atomic_load(&g_mgr_stopping) || pcomm_shutdown_requested()) return;
     pthread_mutex_lock(&g_mgr_mu);
-    pcomm_circuit_t *p = g_primary;
-    pcomm_circuit_t *s = g_spare;
-    pthread_mutex_unlock(&g_mgr_mu);
-
-    if (!p) {
-        pcomm_circuit_t *nc = build_new_circuit(0, NULL, 0, NULL);
-        if (nc) {
-            pthread_mutex_lock(&g_mgr_mu);
-            if (!g_primary) g_primary = nc; else circuit_close_internal(nc);
-            pthread_mutex_unlock(&g_mgr_mu);
-        }
+    if (atomic_load(&g_mgr_stopping) || pcomm_shutdown_requested()) {
+        pthread_mutex_unlock(&g_mgr_mu);
         return;
     }
+    pcomm_circuit_t *p = g_primary;
+    pcomm_circuit_t *s = g_spare;
+    pcomm_circuit_t *retired_primary = NULL, *retired_spare = NULL;
+    if (p && !atomic_load(&p->running)) {
+        retired_primary = p;
+        g_primary = g_spare;
+        g_spare = NULL;
+    }
+    if (g_spare && !atomic_load(&g_spare->running)) {
+        retired_spare = g_spare;
+        g_spare = NULL;
+    }
+    p = g_primary;
+    s = g_spare;
+    pthread_mutex_unlock(&g_mgr_mu);
+    pcomm_circuit_close(retired_primary);
+    pcomm_circuit_close(retired_spare);
 
+    if (!p) {
+        mgr_install(build_new_circuit(0, NULL, 0, NULL), 0);
+        return;
+    }
     time_t now = time(NULL);
-    if (g_cfg.circuit_max_age_sec > 0 && (uint32_t)(now - p->created_at) > g_cfg.circuit_max_age_sec) {
-        if (!s) {
-            pcomm_circuit_t *ns = build_new_circuit(0, NULL, 0, NULL);
-            if (ns) {
-                pthread_mutex_lock(&g_mgr_mu);
-                if (!g_spare) g_spare = ns; else circuit_close_internal(ns);
-                pthread_mutex_unlock(&g_mgr_mu);
-            }
-        }
+    if (g_cfg.circuit_max_age_sec > 0 &&
+        (uint32_t)(now - p->created_at) > g_cfg.circuit_max_age_sec) {
+        if (!s) mgr_install(build_new_circuit(0, NULL, 0, NULL), 1);
         pthread_mutex_lock(&g_mgr_mu);
-        if (g_spare) {
-            pcomm_circuit_t *old = g_primary;
+        pcomm_circuit_t *old = NULL;
+        if (g_spare && !atomic_load(&g_mgr_stopping) && !pcomm_shutdown_requested()) {
+            old = g_primary;
             g_primary = g_spare;
             g_spare = NULL;
-            pthread_mutex_unlock(&g_mgr_mu);
-            circuit_close_internal(old);
-            return;
         }
         pthread_mutex_unlock(&g_mgr_mu);
+        pcomm_circuit_close(old);
     }
-
-    if (g_cfg.circuit_pool_size >= 2 && !s) {
-        pcomm_circuit_t *ns = build_new_circuit(0, NULL, 0, NULL);
-        if (ns) {
-            pthread_mutex_lock(&g_mgr_mu);
-            if (!g_spare) g_spare = ns; else circuit_close_internal(ns);
-            pthread_mutex_unlock(&g_mgr_mu);
-        }
-    }
-
-    if (p && !p->running) {
-        pthread_mutex_lock(&g_mgr_mu);
-        if (g_primary == p) {
-            mgr_swap_primary_locked();
-        }
-        pthread_mutex_unlock(&g_mgr_mu);
-    }
-    if (s && !s->running) {
-        pthread_mutex_lock(&g_mgr_mu);
-        if (g_spare == s) {
-            circuit_close_internal(g_spare);
-            g_spare = NULL;
-        }
-        pthread_mutex_unlock(&g_mgr_mu);
+    pthread_mutex_lock(&g_mgr_mu);
+    int need_spare = g_cfg.circuit_pool_size >= 2 && !g_spare;
+    pthread_mutex_unlock(&g_mgr_mu);
+    if (need_spare && !atomic_load(&g_mgr_stopping) && !pcomm_shutdown_requested()) {
+        mgr_install(build_new_circuit(0, NULL, 0, NULL), 1);
     }
 }
 
@@ -710,43 +813,150 @@ static void *mgr_loop(void *arg) {
     (void)arg;
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
-    for (;;) {
+    while (!atomic_load(&g_mgr_stopping) && !pcomm_shutdown_requested()) {
         mgr_tick();
-        usleep(500 * 1000);
+        circuit_reap_closed();
+        if (pcomm_shutdown_wait(500) != 0) break;
     }
     return NULL;
 }
 
 int pcomm_circuits_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db) {
-    if (!cfg || !me || !db) return -1;
+    if (!cfg || !me || !db || pcomm_shutdown_requested()) return -1;
+    pthread_mutex_lock(&g_mgr_mu);
+    if (g_mgr_started) {
+        pthread_mutex_unlock(&g_mgr_mu);
+        return 0;
+    }
+    if (g_circuits) {
+        pthread_mutex_unlock(&g_mgr_mu);
+        return -1;
+    }
+    atomic_store(&g_mgr_stopping, 0);
     g_cfg = *cfg;
     g_me = *me;
     g_db = db;
 
-    if (pthread_create(&g_mgr_th, NULL, mgr_loop, NULL) != 0) return -1;
-    pthread_detach(g_mgr_th);
+    if (pthread_create(&g_mgr_th, NULL, mgr_loop, NULL) != 0) {
+        g_db = NULL;
+        pthread_mutex_unlock(&g_mgr_mu);
+        return -1;
+    }
+    g_mgr_started = 1;
+    pthread_mutex_unlock(&g_mgr_mu);
     return 0;
 }
 
 pcomm_circuit_t *pcomm_circuit_get(void) {
     pthread_mutex_lock(&g_mgr_mu);
-    pcomm_circuit_t *c = g_primary;
+    pcomm_circuit_t *c = !atomic_load(&g_mgr_stopping) && !pcomm_shutdown_requested() ? g_primary : NULL;
+    if (c && atomic_load(&c->running)) c->refs++;
+    else c = NULL;
     pthread_mutex_unlock(&g_mgr_mu);
     return c;
+}
+
+int pcomm_circuit_retain(pcomm_circuit_t *c) {
+    if (!c) return -1;
+    pthread_mutex_lock(&g_mgr_mu);
+    int ok = !c->owner_released && c->refs > 0 && atomic_load(&c->running) &&
+        !atomic_load(&g_mgr_stopping) && !pcomm_shutdown_requested();
+    if (ok) c->refs++;
+    pthread_mutex_unlock(&g_mgr_mu);
+    return ok ? 0 : -1;
+}
+
+void pcomm_circuit_release(pcomm_circuit_t *c) {
+    if (!c) return;
+    pthread_mutex_lock(&g_mgr_mu);
+    if (c->refs > 0) c->refs--;
+    pthread_cond_broadcast(&g_mgr_cv);
+    pthread_mutex_unlock(&g_mgr_mu);
+}
+
+void pcomm_circuits_request_stop(void) {
+    atomic_store(&g_mgr_stopping, 1);
+    pthread_mutex_lock(&g_mgr_mu);
+    for (pcomm_circuit_t *c = g_circuits; c; c = c->registry_next) circuit_request_stop(c);
+    pthread_cond_broadcast(&g_mgr_cv);
+    pthread_mutex_unlock(&g_mgr_mu);
+}
+
+void pcomm_circuits_stop(void) {
+    pcomm_circuits_request_stop();
+    pthread_mutex_lock(&g_mgr_mu);
+    int join_manager = g_mgr_started;
+    pthread_t manager = g_mgr_th;
+    pthread_mutex_unlock(&g_mgr_mu);
+    if (join_manager) pthread_join(manager, NULL);
+    pthread_mutex_lock(&g_mgr_mu);
+    g_mgr_started = 0;
+    g_primary = NULL;
+    g_spare = NULL;
+    for (pcomm_circuit_t *c = g_circuits; c; c = c->registry_next) {
+        if (!c->owner_released) {
+            c->owner_released = 1;
+            c->refs--;
+        }
+    }
+    while (g_circuits) {
+        pcomm_circuit_t *c = g_circuits;
+        while (c->refs > 0) pthread_cond_wait(&g_mgr_cv, &g_mgr_mu);
+        g_circuits = c->registry_next;
+        pthread_mutex_unlock(&g_mgr_mu);
+        circuit_destroy(c);
+        pthread_mutex_lock(&g_mgr_mu);
+    }
+    g_db = NULL;
+    pthread_mutex_unlock(&g_mgr_mu);
 }
 
 int pcomm_circuit_set_event_cb(pcomm_circuit_t *c, pcomm_relay_event_cb cb, void *arg) {
     if (!c) return -1;
     pthread_mutex_lock(&c->mu);
+    if (cb && (!atomic_load(&c->running) || pcomm_shutdown_requested())) {
+        pthread_mutex_unlock(&c->mu);
+        return -1;
+    }
     c->event_cb = cb;
     c->event_cb_arg = arg;
+    if (!cb && !(c->rx_started && pthread_equal(pthread_self(), c->rx_thread))) {
+        while (c->active_callbacks) pthread_cond_wait(&c->cv, &c->mu);
+    }
     pthread_mutex_unlock(&c->mu);
     return 0;
+}
+
+void pcomm_circuits_detach_events(void *arg) {
+    if (!arg) return;
+    for (;;) {
+        pthread_mutex_lock(&g_mgr_mu);
+        pcomm_circuit_t *found = NULL;
+        for (pcomm_circuit_t *c = g_circuits; c; c = c->registry_next) {
+            pthread_mutex_lock(&c->mu);
+            int matches = (c->event_cb && c->event_cb_arg == arg) ||
+                (c->active_callbacks && c->active_cb_arg == arg);
+            pthread_mutex_unlock(&c->mu);
+            if (matches) {
+                c->refs++;
+                found = c;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_mgr_mu);
+        if (!found) break;
+        (void)pcomm_circuit_set_event_cb(found, NULL, NULL);
+        pcomm_circuit_release(found);
+    }
 }
 
 int pcomm_circuit_alloc_stream(pcomm_circuit_t *c, uint16_t *stream_id_out) {
     if (!c || !stream_id_out) return -1;
     pthread_mutex_lock(&c->mu);
+    if (!atomic_load(&c->running) || pcomm_shutdown_requested()) {
+        pthread_mutex_unlock(&c->mu);
+        return -1;
+    }
     uint16_t sid = alloc_stream_id_locked(c);
     pthread_mutex_unlock(&c->mu);
     *stream_id_out = sid;
@@ -785,14 +995,12 @@ static pcomm_circuit_t *build_dedicated_circuit(const pcomm_config_t *cfg, const
 
     if (n == 0) return NULL;
 
-    pcomm_circuit_t *c = (pcomm_circuit_t*)calloc(1, sizeof(*c));
+    pcomm_circuit_t *c = circuit_new(cfg, 1);
     if (!c) return NULL;
-    c->cfg = *cfg;
-    c->is_dedicated = 1;
 
     (void)me;
     if (circuit_build(c, path, n) != 0) {
-        circuit_close_internal(c);
+        pcomm_circuit_close(c);
         return NULL;
     }
     return c;
@@ -801,13 +1009,22 @@ static pcomm_circuit_t *build_dedicated_circuit(const pcomm_config_t *cfg, const
 pcomm_circuit_t *pcomm_circuit_create_to_exit(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db,
                                               const char *exit_host, uint16_t exit_port,
                                               const char *exclude_uid) {
-    if (!cfg || !me || !db || !exit_host || exit_port == 0) return NULL;
+    if (!cfg || !me || !db || !exit_host || exit_port == 0 ||
+        atomic_load(&g_mgr_stopping) || pcomm_shutdown_requested()) return NULL;
 
     return build_dedicated_circuit(cfg, me, db, exit_host, exit_port, exclude_uid);
 }
 
 void pcomm_circuit_close(pcomm_circuit_t *c) {
-    circuit_close_internal(c);
+    if (!c) return;
+    circuit_request_stop(c);
+    pthread_mutex_lock(&g_mgr_mu);
+    if (!c->owner_released) {
+        c->owner_released = 1;
+        c->refs--;
+    }
+    pthread_cond_broadcast(&g_mgr_cv);
+    pthread_mutex_unlock(&g_mgr_mu);
 }
 
 int pcomm_circuit_rpc(pcomm_circuit_t *c,
@@ -821,13 +1038,19 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
     if (resp_payload_len_out) *resp_payload_len_out = 0;
     if (resp_type_out) *resp_type_out = 0;
 
-    if (!c || !dest_host || dest_port == 0) return -1;
+    if (!c || !dest_host || dest_port == 0 ||
+        !atomic_load(&c->running) || pcomm_shutdown_requested()) return -1;
 
     uint8_t *inner = NULL;
     uint32_t inner_len = 0;
     if (pcomm_pack_packet(inner_type, NULL, inner_payload, inner_payload_len, &inner, &inner_len) != 0) return -1;
 
     pthread_mutex_lock(&c->mu);
+    if (!atomic_load(&c->running) || pcomm_shutdown_requested()) {
+        pthread_mutex_unlock(&c->mu);
+        free(inner);
+        return -1;
+    }
     uint16_t sid = alloc_stream_id_locked(c);
     stream_wait_t *w = stream_wait_new(sid);
     if (!w || stream_map_put(c, w) != 0) {
@@ -888,7 +1111,7 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
     ts.tv_sec += 5;
 
     pthread_mutex_lock(&w->mu);
-    while (!w->done) {
+    while (!w->done && atomic_load(&c->running) && !pcomm_shutdown_requested()) {
         if (pthread_cond_timedwait(&w->cv, &w->mu, &ts) == ETIMEDOUT) break;
     }
     int ok = (w->done && w->saw_end && !w->err && w->len >= PCOMM_HDR_LEN);

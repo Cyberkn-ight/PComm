@@ -3,6 +3,7 @@
 #include "proto.h"
 #include "identity.h"
 #include "crypto.h"
+#include "lifecycle.h"
 
 #include <pthread.h>
 #include <sqlite3.h>
@@ -115,28 +116,75 @@ typedef struct {
     pcomm_config_t cfg;
     pcomm_identity_t me;
     pcomm_db_t *db;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_mutex_t fd_mu;
+    int fd;
+    int running;
 } mesh_state_t;
+
+static mesh_state_t *g_mesh = NULL;
+static pthread_mutex_t g_mesh_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int mesh_running(mesh_state_t *st) {
+    pthread_mutex_lock(&st->mu);
+    int running = st->running;
+    pthread_mutex_unlock(&st->mu);
+    return running && !pcomm_shutdown_requested();
+}
+
+static int mesh_wait(mesh_state_t *st, uint64_t milliseconds) {
+    while (milliseconds > 0 && mesh_running(st)) {
+        uint32_t chunk = milliseconds > 100u ? 100u : (uint32_t)milliseconds;
+        if (pcomm_shutdown_wait(chunk) != 0) return -1;
+        milliseconds -= chunk;
+    }
+    return mesh_running(st) ? 0 : -1;
+}
+
+static int mesh_connect_tcp(mesh_state_t *st, const char *host, uint16_t port) {
+    int fd = net_connect_tcp(host, port);
+    if (fd < 0) return -1;
+    pthread_mutex_lock(&st->fd_mu);
+    if (!mesh_running(st)) {
+        net_shutdown(fd);
+        net_close(fd);
+        fd = -1;
+    } else {
+        st->fd = fd;
+    }
+    pthread_mutex_unlock(&st->fd_mu);
+    return fd;
+}
+
+static void mesh_close_tcp(mesh_state_t *st, int fd) {
+    pthread_mutex_lock(&st->fd_mu);
+    st->fd = -1;
+    net_close(fd);
+    pthread_mutex_unlock(&st->fd_mu);
+}
 
 static void *mesh_thread(void *arg) {
     mesh_state_t *st = (mesh_state_t*)arg;
 
-    for (;;) {
+    while (mesh_running(st)) {
         pcomm_peer_t peer;
         if (pick_random_relay(st->db, &peer) == 0) {
             {
-                int fd = net_connect_tcp(peer.host, peer.port);
+                int fd = mesh_connect_tcp(st, peer.host, peer.port);
                 if (fd >= 0) {
                     uint8_t *hello = NULL; uint32_t hello_len = 0;
                     if (build_hello(&st->cfg, &st->me, &hello, &hello_len) == 0) {
                         pcomm_send_packet(fd, PCOMM_MSG_CTRL, NULL, hello, hello_len);
                     }
                     free(hello);
-                    close(fd);
+                    mesh_close_tcp(st, fd);
                 }
             }
 
+            if (!mesh_running(st)) break;
             {
-                int fd = net_connect_tcp(peer.host, peer.port);
+                int fd = mesh_connect_tcp(st, peer.host, peer.port);
                 if (fd >= 0) {
                     uint8_t *req = NULL; uint32_t req_len = 0;
                     if (build_peers_req(64, &req, &req_len) == 0) {
@@ -145,7 +193,7 @@ static void *mesh_thread(void *arg) {
                             uint8_t eph[32];
                             uint8_t *rp = NULL; uint32_t rpl = 0;
                             if (pcomm_recv_packet(fd, &rtype, eph, &rp, &rpl) == 0) {
-                                if (rtype == PCOMM_MSG_CTRL) {
+                                if (rtype == PCOMM_MSG_CTRL && mesh_running(st)) {
                                     parse_peers_resp(st->db, rp, rpl);
                                 }
                                 free(rp);
@@ -153,36 +201,79 @@ static void *mesh_thread(void *arg) {
                         }
                     }
                     free(req);
-                    close(fd);
+                    mesh_close_tcp(st, fd);
                 }
             }
         }
 
-        uint8_t r[1];
-        pcomm_random(r, 1);
-        int base = (int)st->cfg.mesh_gossip_base_sec;
+        uint8_t r = 0;
+        (void)pcomm_random(&r, 1);
+        uint32_t base = st->cfg.mesh_gossip_base_sec;
         if (base < 3) base = 3;
-        int delay = base + (r[0] % base);
-        sleep(delay);
+        uint64_t delay = (uint64_t)base + (r % base);
+        if (mesh_wait(st, delay * 1000u) != 0) break;
     }
     return NULL;
 }
 
 int pcomm_mesh_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db) {
-    if (!cfg || !me || !db) return -1;
+    if (!cfg || !me || !db || !db->db || pcomm_shutdown_requested()) return -1;
+    pthread_mutex_lock(&g_mesh_mu);
+    if (g_mesh) {
+        pthread_mutex_unlock(&g_mesh_mu);
+        return 0;
+    }
 
     mesh_state_t *st = (mesh_state_t*)calloc(1, sizeof(mesh_state_t));
-    if (!st) return -1;
+    if (!st) {
+        pthread_mutex_unlock(&g_mesh_mu);
+        return -1;
+    }
+    if (pthread_mutex_init(&st->mu, NULL) != 0) {
+        free(st);
+        pthread_mutex_unlock(&g_mesh_mu);
+        return -1;
+    }
+    if (pthread_mutex_init(&st->fd_mu, NULL) != 0) {
+        pthread_mutex_destroy(&st->mu);
+        free(st);
+        pthread_mutex_unlock(&g_mesh_mu);
+        return -1;
+    }
     st->cfg = *cfg;
     st->me = *me;
     st->db = db;
+    st->fd = -1;
+    st->running = 1;
 
-    pthread_t th;
-    if (pthread_create(&th, NULL, mesh_thread, st) != 0) {
+    if (pthread_create(&st->thread, NULL, mesh_thread, st) != 0) {
+        pthread_mutex_destroy(&st->fd_mu);
+        pthread_mutex_destroy(&st->mu);
         free(st);
+        pthread_mutex_unlock(&g_mesh_mu);
         return -1;
     }
-    pthread_detach(th);
+    g_mesh = st;
+    pthread_mutex_unlock(&g_mesh_mu);
     fprintf(stderr, "Mesh gossip started\n");
     return 0;
+}
+
+void pcomm_mesh_stop(void) {
+    pthread_mutex_lock(&g_mesh_mu);
+    mesh_state_t *st = g_mesh;
+    if (st) {
+        pthread_mutex_lock(&st->mu);
+        st->running = 0;
+        pthread_mutex_unlock(&st->mu);
+        pthread_mutex_lock(&st->fd_mu);
+        if (st->fd >= 0) net_shutdown(st->fd);
+        pthread_mutex_unlock(&st->fd_mu);
+        pthread_join(st->thread, NULL);
+        pthread_mutex_destroy(&st->fd_mu);
+        pthread_mutex_destroy(&st->mu);
+        g_mesh = NULL;
+        free(st);
+    }
+    pthread_mutex_unlock(&g_mesh_mu);
 }

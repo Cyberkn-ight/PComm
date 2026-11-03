@@ -9,8 +9,14 @@
 typedef struct pcomm_circuit pcomm_circuit_t;
 
 int pcomm_circuits_start(const pcomm_config_t *cfg, const pcomm_identity_t *me, pcomm_db_t *db);
+void pcomm_circuits_request_stop(void);
+void pcomm_circuits_stop(void);
 
 pcomm_circuit_t *pcomm_circuit_get(void);
+int pcomm_circuit_retain(pcomm_circuit_t *c);
+void pcomm_circuit_release(pcomm_circuit_t *c);
+
+void pcomm_circuits_detach_events(void *arg);
 
 int pcomm_circuit_rpc(pcomm_circuit_t *c,
                       const char *dest_host, uint16_t dest_port,
@@ -19,7 +25,6 @@ int pcomm_circuit_rpc(pcomm_circuit_t *c,
                       int expect_resp,
                       pcomm_msg_type_t *resp_type_out,
                       uint8_t **resp_payload_out, uint32_t *resp_payload_len_out);
-
 
 typedef void (*pcomm_relay_event_cb)(void *arg, pcomm_circuit_t *c,
                                      uint8_t relay_cmd, uint16_t stream_id,

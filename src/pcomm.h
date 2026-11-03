@@ -73,6 +73,13 @@ typedef struct {
 } pcomm_peer_t;
 
 typedef struct {
+    char host[64];
+    uint16_t port;
+} pcomm_bootstrap_t;
+
+#define PCOMM_MAX_BOOTSTRAP 16u
+
+typedef struct {
     char data_dir[512];
     char ui_dir[512];
 
@@ -86,6 +93,8 @@ typedef struct {
     uint16_t http_port;
 
     char peers_path[512];
+    pcomm_bootstrap_t bootstrap[PCOMM_MAX_BOOTSTRAP];
+    size_t bootstrap_count;
 
     bool allow_private_addrs;
 
